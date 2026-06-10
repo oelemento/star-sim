@@ -1,0 +1,3 @@
+Before we run anything on the physical Hamilton STAR, we will simulate it first. There is an open-source Python SDK called PyLabRobot that has full support for the Hamilton STAR and includes a simulation backend and a browser-based visualizer.
+
+The same protocol code runs against the simulator or the real robot, and a single flag switches between them. We can develop and debug protocols with no robot and no risk, since overfills, missing tips, and bad volumes all surface in software rather than on the instrument.

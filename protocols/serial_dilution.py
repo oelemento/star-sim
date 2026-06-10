@@ -17,6 +17,7 @@ All volumes stay within the 2 mL well capacity.
 import asyncio
 
 from star_sim.deck import DeckLayout
+from star_sim.tip_manager import TipManager
 from pylabrobot.liquid_handling import LiquidHandler
 
 # A column is 8 wells (rows A-H) addressed for the 8-channel head.
@@ -29,20 +30,21 @@ def _column(plate, col: int):
 
 
 def prime_source(layout: DeckLayout, dye_volume: float, buffer_volume: float) -> None:
-    """Set starting liquids in the source plate so the simulator can track them.
+    """Set starting volumes in the source plate so the simulator can track them.
 
     Column 1 gets dye, column 2 gets buffer. On the physical robot this step is
     done by the operator filling the plate; here it seeds the volume tracker.
     """
     for well in _column(layout.source_plate, 1):
-        well.tracker.set_liquids([("dye", dye_volume)])
+        well.tracker.set_volume(dye_volume)
     for well in _column(layout.source_plate, 2):
-        well.tracker.set_liquids([("buffer", buffer_volume)])
+        well.tracker.set_volume(buffer_volume)
 
 
 async def run(
     lh: LiquidHandler,
     layout: DeckLayout,
+    tips: TipManager,
     n_columns: int = 6,
     transfer_volume: float = 100.0,
     step_delay: float = 0.0,
@@ -55,9 +57,13 @@ async def run(
       3. Serially transfer `transfer_volume` from column k to k+1 (k=1..n-1),
          halving concentration at each step.
 
+    Consumes 3 tip columns total: one for the buffer pre-fill, one for seeding
+    the dye, and one shared across all serial transfer steps.
+
     Args:
         lh: a set-up LiquidHandler (sim or hardware).
         layout: the deck layout from build_starlet_deck().
+        tips: TipManager providing fresh tip columns on demand.
         n_columns: number of columns in the dilution series (>= 2).
         transfer_volume: per-channel transfer volume in uL.
         step_delay: seconds to pause after each aspirate/dispense. Use a nonzero
@@ -82,7 +88,6 @@ async def run(
         raise ValueError(
             f"n_columns ({n_columns}) exceeds destination plate columns ({n_dst_cols})"
         )
-    rack = layout.tip_rack
     vols = [transfer_volume] * len(ROWS)
 
     # Buffer needed per source well: one transfer per pre-filled column (2..n)
@@ -93,34 +98,35 @@ async def run(
     prime_source(layout, dye_volume=dye_needed + transfer_volume,
                  buffer_volume=buffer_needed + transfer_volume)
 
-    tips = rack["A1:H1"]
-
     # --- 1. Pre-fill destination columns 2..n with buffer ---
-    await lh.pick_up_tips(tips)
+    tip_col = tips.next_column()
+    await lh.pick_up_tips(tip_col)
     for col in range(2, n_columns + 1):
         await lh.aspirate(_column(src, 2), vols=vols)
         await pause()
         await lh.dispense(_column(dst, col), vols=vols)
         await pause()
-    await lh.drop_tips(tips)
+    await lh.drop_tips(tip_col)
 
     # --- 2. Seed destination column 1 with 2x dye ---
-    await lh.pick_up_tips(tips)
+    tip_col = tips.next_column()
+    await lh.pick_up_tips(tip_col)
     double = [2 * transfer_volume] * len(ROWS)
     await lh.aspirate(_column(src, 1), vols=double)
     await pause()
     await lh.dispense(_column(dst, 1), vols=double)
     await pause()
-    await lh.drop_tips(tips)
+    await lh.drop_tips(tip_col)
 
-    # --- 3. Serial transfer down the row, fresh tips per step to avoid carryover ---
+    # --- 3. Serial transfer down the row ---
+    tip_col = tips.next_column()
+    await lh.pick_up_tips(tip_col)
     for k in range(1, n_columns):
-        await lh.pick_up_tips(tips)
         await lh.aspirate(_column(dst, k), vols=vols)
         await pause()
         await lh.dispense(_column(dst, k + 1), vols=vols)
         await pause()
-        await lh.drop_tips(tips)
+    await lh.drop_tips(tip_col)
 
 
 def report(layout: DeckLayout, n_columns: int = 6) -> str:

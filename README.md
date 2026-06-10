@@ -24,6 +24,9 @@ pip3.11 install --user -r requirements.txt
 # Simulation, headless — prints every robot action and a volume report
 python3.11 run.py
 
+# Simulation with pre-set serial dilution script
+python3.11 run.py --scripted
+
 # Simulation with the live 3D browser visualizer
 python3.11 run.py --visualize
 
@@ -35,25 +38,14 @@ python3.11 run.py --hardware
 
 ```
 star_sim/
-  deck.py     build_starlet_deck() -> deck + named resource handles
-  lab.py      make_liquid_handler(use_hardware) -> sim or STAR backend
+  deck.py         build_starlet_deck() -> deck + named resource handles
+  lab.py          make_liquid_handler(use_hardware) -> sim or STAR backend
+  env.py          observe() -> current machine state, useful for agent entry points
+  plate_map.py    PlateMap -> tracks compounds and concentrations
+  tip_manager.py  TipManager -> cursor over tip rack
 protocols/
-  serial_dilution.py   demo: 8-channel 2-fold serial dilution
+  serial_dilution.py   demo: 8-channel 2-fold serial dilution (unused)
+  primitives.py        protocol primitives used by the agent such as single-use column transfer or serial transfer
+agent.py      Claude-based, local Ollama-based, and scripted runs
 run.py        CLI entry point
-```
-
-## What the demo does
-
-An 8-channel 2-fold serial dilution across N columns of a 96-well plate:
-pre-fill buffer, seed dye, then serially transfer down the row with fresh tips
-per step. Deterministic and parameterized (`--columns`) so it can later be
-driven by an AI agent.
-
-## Next: AI-directed experiments
-
-The deck exposes named resources and the protocol is a parameterized function —
-the two pieces an agent layer needs. A planned next step wraps deck state as a
-structured observation and the liquid-handling verbs as a tool schema, letting a
-Claude agent run closed-loop design-measure-learn cycles against the twin (add a
-simulated plate reader for the "measure" half).
 ```

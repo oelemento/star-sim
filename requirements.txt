@@ -1,3 +1,5 @@
 # Hamilton STAR digital twin
-# Tested with pylabrobot 0.2.1 on Python 3.11.
+# Tested with pylabrobot 0.2.1, anthropic 0.107+ on Python 3.11+.
 pylabrobot>=0.2.1
+anthropic>=0.50.0
+python-dotenv
