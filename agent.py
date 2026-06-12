@@ -11,7 +11,6 @@ local models through Ollama.
 from __future__ import annotations
 
 import json
-from typing import Any
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -221,11 +220,18 @@ async def run_scripted(
     Raises RuntimeError immediately on any tool error so the problem is visible.
     """
     for name, args in script:
+        if confirm:
+            decision = _confirm_scripted(name, args)
+            if decision is None:
+                print(f"  [skipped] {name}")
+                continue
+            name, args = decision
+
         args_str = json.dumps(args)
         if len(args_str) > 120:
             args_str = args_str[:117] + "..."
         print(f"\n[scripted] {name}({args_str})")
-        result = await _dispatch(name, args, env, step_delay, confirm=confirm)
+        result = await _dispatch(name, args, env, step_delay)
         summary = json.dumps(result, indent=2)
         if len(summary) > 300:
             summary = summary[:297] + "..."
@@ -284,19 +290,20 @@ async def run_agent(
     goal: str,
     step_delay: float = 0.0,
     confirm: bool = False,
-) -> str:
+) -> tuple[str, list[ToolCall]]:
     """Drive Claude to execute `goal` on the robot.
 
-    Updates env.plate_map throughout. Returns the agent's final text response.
+    Updates env.plate_map throughout. Returns (final_text, record) where record
+    is a list of (name, args) tool calls that were actually executed.
     Requires ANTHROPIC_API_KEY in the environment.
     """
     client = anthropic.AsyncAnthropic()
     messages: list[dict] = [{"role": "user", "content": goal}]
-    
-    print("[user]  Attempting the following goal: " + goal)
+    record: list[ToolCall] = []
+
+    print("\n[user]  " + goal)
 
     while True:
-        print("[user]  Prompting Claude model...")
         response: Message = await client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
@@ -312,19 +319,39 @@ async def run_agent(
                 args_str = json.dumps(block.input)
                 if len(args_str) > 120:
                     args_str = args_str[:117] + "..."
-                print(f"\n[tool]  {block.name}({args_str})")
+                print(f"\n[agent/tool]  {block.name}({args_str})")
 
         messages.append({"role": "assistant", "content": response.content})
 
-        # todo: check for other response types?
         if response.stop_reason != "tool_use":
-            return next((b.text for b in response.content if hasattr(b, "text")), "")
+            final = next((b.text for b in response.content if hasattr(b, "text")), "NO FINAL TEXT GIVEN")
+            return final, record
 
         tool_results = []
+        injection: UserInjection | None = None
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            result = await _dispatch(block.name, block.input, env, step_delay, confirm=confirm)
+            name, args = block.name, dict(block.input)
+
+            if confirm and injection is None:
+                try:
+                    decision = _confirm_agent(name, args)
+                except UserInjection as exc:
+                    injection = exc
+                    decision = None
+                if decision is None:
+                    print(f"  [skipped] {name}")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps({"skipped": True}),
+                    })
+                    continue
+                name, args = decision
+
+            result = await _dispatch(name, args, env, step_delay)
+            record.append((name, args))
             summary = json.dumps(result)
             if len(summary) > 300:
                 summary = summary[:297] + "..."
@@ -337,116 +364,70 @@ async def run_agent(
 
         messages.append({"role": "user", "content": tool_results})
 
-# ---------------------------------------------------------------------------
-# Ollama adapter: same loop, OpenAI-compatible format
-# ---------------------------------------------------------------------------
-
-def _to_openai_tools(tools: list[dict]) -> list[dict]:
-    """Convert Anthropic tool schemas to OpenAI function-calling format."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["input_schema"],
-            },
-        }
-        for t in tools
-    ]
-
-async def run_agent_ollama(
-    env: RobotEnv,
-    goal: str,
-    model: str = "qwen2.5:7b",
-    host: str = "http://localhost:11434",
-    step_delay: float = 0.0,
-    confirm: bool = False,
-) -> str:
-    """Drive a locally-running Ollama model to execute `goal`.
-
-    Setup:
-        brew install ollama       # or download from ollama.com
-        ollama serve              # start a local server
-        ollama pull qwen2.5:7b    # download the model (~4 GB)
-        pip install openai        # OpenAI-compatible client
-
-    Recommended models (tool-use quality, best first):
-        qwen2.5:14b  — best reasoning, ~8 GB
-        qwen2.5:7b   — good balance, ~4 GB (default)
-        llama3.1:8b  — solid alternative
-    """
-    try:
-        from openai import AsyncOpenAI
-    except ImportError:
-        raise ImportError("Run: pip install openai  (needed for the Ollama adapter)")
-
-    client = AsyncOpenAI(base_url=f"{host}/v1", api_key="ollama")
-    openai_tools = _to_openai_tools(TOOLS)
-    messages: list[dict] = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": goal},
-    ]
-
-    while True:
-        print("[user]  Prompting local model...")
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=openai_tools,
-            tool_choice="auto",
-        )
-        msg = response.choices[0].message
-
-        if msg.content and msg.content.strip():
-            print(f"\n[agent]  {msg.content.strip()}")
-        for tc in (msg.tool_calls or []):
-            args_str = tc.function.arguments
-            if len(args_str) > 120:
-                args_str = args_str[:117] + "..."
-            print(f"\n[tool]  {tc.function.name}({args_str})")
-
-        messages.append(msg.model_dump())
-
-        if not msg.tool_calls:
-            return msg.content or ""
-
-        tool_messages = []
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
-            result = await _dispatch(tc.function.name, args, env, step_delay, confirm=confirm)
-            summary = json.dumps(result)
-            if len(summary) > 300:
-                summary = summary[:297] + "..."
-            print(f"  → {summary}\n")
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": json.dumps(result),
-            })
-        messages.extend(tool_messages)
+        if injection is not None:
+            messages.append({"role": "user", "content": injection.text})
         
 
 # ---------------------------------------------------------------------------
-# User confirmation helper
+# Interactive confirmation
 # ---------------------------------------------------------------------------
 
-def _prompt_confirm() -> bool:
-    """Print an upcoming tool call and wait for user input.
+class UserInjection(Exception):
+    """Raised during agent confirm when the user wants to redirect the LLM."""
+    def __init__(self, text: str) -> None:
+        self.text = text
 
-    Returns True to proceed, False to skip. Raises KeyboardInterrupt on 'q'.
+
+def _confirm_scripted(name: str, args: dict) -> tuple[str, dict] | None:
+    """Step-through prompt for scripted replay: run, skip, replace, or quit.
+
+    No message injection — there is no LLM to redirect in scripted mode.
+    Returns (name, args) to execute (possibly replaced), None to skip.
+    Raises KeyboardInterrupt on quit.
     """
-    print(f"\n[next]  Do you want to run the above tool?")
+    args_str = json.dumps(args)
+    if len(args_str) > 120:
+        args_str = args_str[:117] + "..."
+    print(f"\n[next]  {name}({args_str})")
     try:
-        ans = input("  Enter=run  s=skip  q=quit: ").strip().lower()
+        ans = input("  Enter=run  s=skip  r=replace  q=quit: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         raise KeyboardInterrupt
     if ans == "q":
-        raise KeyboardInterrupt("User aborted step-through")
-    return ans != "s"
+        raise KeyboardInterrupt("User aborted")
+    if ans == "s":
+        return None
+    if ans == "r":
+        new_name = input("  Tool name: ").strip()
+        raw = input("  Args (JSON, or empty for {}): ").strip()
+        new_args = json.loads(raw) if raw else {}
+        return new_name, new_args
+    return name, args
+
+
+def _confirm_agent(name: str, args: dict) -> tuple[str, dict] | None:
+    """Full interactive prompt for agent runs: run, skip, replace, message, or quit.
+
+    Returns (name, args) to execute (possibly replaced), None to skip.
+    Raises UserInjection when the user wants to redirect the LLM.
+    Raises KeyboardInterrupt on quit.
+    """
+    try:
+        ans = input("\n[next]  Enter=run  s=skip  r=replace  m=message  q=quit: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if ans == "q":
+        raise KeyboardInterrupt("User aborted")
+    if ans == "s":
+        return None
+    if ans == "r":
+        new_name = input("  Tool name: ").strip()
+        raw = input("  Args (JSON, or empty for {}): ").strip()
+        new_args = json.loads(raw) if raw else {}
+        return new_name, new_args
+    if ans == "m":
+        raise UserInjection(input("  Message to agent: ").strip())
+    return name, args
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +453,7 @@ def _clear_emptied_col(env: RobotEnv, plate_name: str, col: int) -> None:
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
-async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float,
-                    confirm: bool = False) -> dict:
-    if confirm and not _prompt_confirm():
-        return {"skipped": True}
+async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float) -> dict:
     try:
         match name:
             case "propose_prime":
@@ -484,7 +462,7 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float,
                 for r in reagents:
                     by_plate.setdefault(r.get("plate", "source_plate"), []).append(r)
                 for plate_name, plate_reagents in by_plate.items():
-                    print(f"\n[prime] {plate_name}:")
+                    print(f"\n[prime]  {plate_name}:")
                     for r in plate_reagents:
                         parts = []
                         if "compound" in r:

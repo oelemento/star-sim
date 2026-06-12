@@ -21,17 +21,26 @@ pip3.11 install --user -r requirements.txt
 ## Run
 
 ```bash
-# Simulation, headless — prints every robot action and a volume report
-python3.11 run.py
+# Headless simulation (prints every tool call and result):
+python run.py
 
-# Simulation with pre-set serial dilution script
-python3.11 run.py --scripted
+# Simulation with the live 3D browser visualizer:
+python run.py --visualize
 
-# Simulation with the live 3D browser visualizer
-python3.11 run.py --visualize
+# Custom experiment goal:
+python run.py --goal "dispense 50 uL from source column 1 into dest columns 1 through 4"
 
-# Drive the physical Hamilton STAR over USB
-python3.11 run.py --hardware
+# Drive the physical Hamilton STAR over USB (no visualizer):
+python run.py --hardware
+
+# Save the agent's steps as a JSON replay file:
+python run.py --record
+
+# Replay a previously recorded run as a scripted run:
+python run.py --replay runs/2026-06-11T12-00-00.json
+
+# Step through each tool call for review:
+python run.py --confirm
 ```
 
 ## Layout

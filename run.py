@@ -16,13 +16,24 @@ Examples:
 
     # Drive the physical Hamilton STAR over USB (no visualizer):
     python run.py --hardware
+
+    # Save the agent's steps as a JSON replay file:
+    python run.py --record
+
+    # Replay a previously recorded run as a scripted run:
+    python run.py --replay runs/2026-06-11T12-00-00.json
+
+    # Step through each tool call for review:
+    python run.py --confirm
 """
 
 import argparse
 import asyncio
 import json
+import os
+from datetime import datetime
 
-from agent import SERIAL_DILUTION_SCRIPT, run_agent, run_agent_ollama, run_scripted
+from agent import SERIAL_DILUTION_SCRIPT, ToolCall, run_agent, run_scripted
 from star_sim import RobotEnv
 from star_sim.deck import DeckLayout
 from pylabrobot.visualizer import Visualizer
@@ -37,16 +48,37 @@ _DEFAULT_GOAL = (
 )
 
 
-def prime_simulation(layout: DeckLayout, wells: dict[str, dict[str, float]]) -> None:
-    """Seed the simulator's volume tracker from a {plate_name: {well_id: volume_ul}} mapping.
+# def prime_simulation(layout: DeckLayout, wells: dict[str, dict[str, float]]) -> None:
+#     """Seed the simulator's volume tracker from a {plate_name: {well_id: volume_ul}} mapping.
 
-    For agent/scripted runs this is called automatically by the propose_prime tool.
-    Exposed here for manual use in one-off scripts or tests.
-    """
-    for plate_name, vol_map in wells.items():
-        plate = getattr(layout, plate_name)
-        for well_id, vol in vol_map.items():
-            plate.get_item(well_id).tracker.set_volume(vol)
+#     For agent/scripted runs this is called automatically by the propose_prime tool.
+#     Exposed here for manual use in one-off scripts or tests.
+#     """
+#     for plate_name, vol_map in wells.items():
+#         plate = getattr(layout, plate_name)
+#         for well_id, vol in vol_map.items():
+#             plate.get_item(well_id).tracker.set_volume(vol)
+
+
+def _save_record(goal: str, final_text: str, record: list[ToolCall]) -> str:
+    """Write the record to runs/<timestamp>.json and return the file path."""
+    os.makedirs("runs", exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    path = f"runs/{ts}.json"
+    with open(path, "w") as f:
+        json.dump({
+            "goal": goal, 
+            "final_text": final_text, 
+            "record": [[name, args] for name, args in record]
+        }, f, indent=2)
+    return path
+
+
+def _load_record(path: str) -> list[ToolCall]:
+    """Load a JSON replay file back into a list of ToolCall tuples."""
+    with open(path) as f:
+        data = json.load(f)
+    return [(name, args) for name, args in data.record]
 
 
 async def _wait_for_browser(vis: Visualizer, timeout: float = 30.0) -> bool:
@@ -68,9 +100,11 @@ async def main(
     goal: str,
     delay: float,
     scripted: bool,
-    ollama: bool,
-    ollama_model: str,
+    # ollama: bool,
+    # ollama_model: str,
     confirm: bool,
+    record: bool,
+    replay: str | None,
 ) -> None:
     env = RobotEnv(use_hardware=use_hardware)
     await env.setup()
@@ -88,15 +122,25 @@ async def main(
             if delay == 0.0:
                 delay = 0.5
 
-        if scripted:
+        run_record: list[ToolCall] | None = None
+
+        if replay is not None:
+            script = _load_record(replay)
+            print(f"[replay]  Loaded {len(script)} steps from {replay}")
+            await run_scripted(env, script, step_delay=delay, confirm=confirm)
+            print("[replay]  Replay completed")
+        elif scripted:
             await run_scripted(env, SERIAL_DILUTION_SCRIPT, step_delay=delay, confirm=confirm)
             print("[script]  Script completed, now printing plate data")
-        elif ollama:
-            await run_agent_ollama(
-                env, goal, model=ollama_model, step_delay=delay, confirm=confirm
-            )
+        # elif ollama:
+        #     _, run_record = await run_agent_ollama(
+        #         env, goal, model=ollama_model, step_delay=delay, confirm=confirm
+        #     )
         else:
-            await run_agent(env, goal, step_delay=delay, confirm=confirm)
+            final_text, run_record = await run_agent(env, goal, step_delay=delay, confirm=confirm)
+            if record and run_record is not None:
+                path = _save_record(goal, final_text, run_record)
+                print(f"\n[record]  Saved {len(run_record)} steps to {path}")
 
         print("\n" + "─" * 60)
         print("\n[user]  Final plate contents:")
@@ -126,14 +170,18 @@ if __name__ == "__main__":
                         help="seconds between robot operations (auto-set to 0.5 with --visualize)")
     parser.add_argument("--confirm", action="store_true", default=False,
                         help="pause before each tool call for step-through debugging")
+    parser.add_argument("--record", action="store_true",
+                        help="write agent steps to runs/<timestamp>.json for later replay")
+    parser.add_argument("--replay", type=str, default=None, metavar="PATH",
+                        help="load a recorded JSON file and run it as a scripted replay")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--scripted", action="store_true",
                       help="replay a hardcoded script (no agent)")
-    mode.add_argument("--ollama", action="store_true",
-                      help="use a local Ollama model (requires ollama)")
-    parser.add_argument("--ollama-model", type=str, default="llama3.1:8b",
-                        help="Ollama model name (default: llama3.1:8b)")
+    # mode.add_argument("--ollama", action="store_true",
+    #                   help="use a local Ollama model (requires ollama)")
+    # parser.add_argument("--ollama-model", type=str, default="llama3.1:8b",
+    #                     help="Ollama model name (default: llama3.1:8b)")
     args = parser.parse_args()
 
     asyncio.run(main(
@@ -142,7 +190,9 @@ if __name__ == "__main__":
         goal=args.goal,
         delay=args.delay,
         scripted=args.scripted,
-        ollama=args.ollama,
-        ollama_model=args.ollama_model,
+        # ollama=args.ollama,
+        # ollama_model=args.ollama_model,
         confirm=args.confirm,
+        record=args.record,
+        replay=args.replay,
     ))
