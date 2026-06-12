@@ -35,16 +35,14 @@ from datetime import datetime
 
 from agent import SERIAL_DILUTION_SCRIPT, ToolCall, run_agent, run_scripted
 from star_sim import RobotEnv
-from star_sim.deck import DeckLayout
 from pylabrobot.visualizer import Visualizer
 
 _DEFAULT_GOAL = (
     "Perform a 2-fold serial dilution of dye across 6 columns of dest_plate. "
     "Use 100 µL transfers. "
-    "Seed dest_plate column 1 with 200 µL of dye (not 100 µL) so that after the serial "
-    "transfer takes 100 µL away, column 1 still retains 100 µL at 200 µM. "
-    "Pre-fill dest_plate columns 2-6 with 100 µL of buffer each before the serial transfer. "
-    "After the serial transfer, dest columns 1-6 should hold 200, 100, 50, 25, 12.5, 6.25 µM."
+    "Starting with just the pre-requisite dye and buffer on src_plate, "
+    "seed dest_plate with some dye and buffer such that after a serial transfer, "
+    "dest columns 1-6 should hold 200, 100, 50, 25, 12.5, 6.25 µM."
 )
 
 

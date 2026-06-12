@@ -231,7 +231,7 @@ async def run_scripted(
         if len(args_str) > 120:
             args_str = args_str[:117] + "..."
         print(f"\n[scripted] {name}({args_str})")
-        result = await _dispatch(name, args, env, step_delay)
+        result = await _dispatch(name, args, env, step_delay, silent=confirm)
         summary = json.dumps(result, indent=2)
         if len(summary) > 300:
             summary = summary[:297] + "..."
@@ -312,14 +312,10 @@ async def run_agent(
             messages=messages,
         )
 
+        # Display any agent messages
         for block in response.content:
             if hasattr(block, "text") and block.text.strip():
                 print(f"\n[agent]  {block.text.strip()}")
-            elif block.type == "tool_use":
-                args_str = json.dumps(block.input)
-                if len(args_str) > 120:
-                    args_str = args_str[:117] + "..."
-                print(f"\n[agent/tool]  {block.name}({args_str})")
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -327,6 +323,7 @@ async def run_agent(
             final = next((b.text for b in response.content if hasattr(b, "text")), "NO FINAL TEXT GIVEN")
             return final, record
 
+        # Execute tool calls, with potential user interaction
         tool_results = []
         injection: UserInjection | None = None
         for block in response.content:
@@ -349,8 +346,7 @@ async def run_agent(
                     })
                     continue
                 name, args = decision
-
-            result = await _dispatch(name, args, env, step_delay)
+            result = await _dispatch(name, args, env, step_delay, silent=confirm)
             record.append((name, args))
             summary = json.dumps(result)
             if len(summary) > 300:
@@ -378,6 +374,63 @@ class UserInjection(Exception):
         self.text = text
 
 
+def _preview(name: str, args: dict) -> str:
+    """Return a human-readable one-or-few-line description of a tool call."""
+    match name:
+        case "propose_prime":
+            lines = ["propose_prime:"]
+            for r in args.get("reagents", []):
+                plate = r.get("plate", "source_plate")
+                col = r.get("col", "?")
+                vol = r.get("volume_ul", "?")
+                parts: list[str] = []
+                if "compound" in r:
+                    conc = f" @ {r['concentration_um']} µM" if "concentration_um" in r else ""
+                    parts.append(f"{r['compound']}{conc}")
+                if "cells" in r:
+                    density = f" ({r['cell_density_per_ml']:.2g} cells/mL)" if "cell_density_per_ml" in r else ""
+                    parts.append(f"{r['cells']}{density}")
+                if not parts:
+                    parts.append("media/buffer")
+                lines.append(f"  {plate} col {col}: {', '.join(parts)}  ({vol} µL/well)")
+            return "\n".join(lines)
+
+        case "column_transfer":
+            tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
+            return (
+                f"column_transfer: {args['src_plate']} col {args['src_col']} → "
+                f"{args['dst_plate']} col {args['dst_col']}  ({args['volume']} µL){tc}"
+            )
+
+        case "multi_dispense":
+            cols = args.get("dst_cols", [])
+            tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
+            return (
+                f"multi_dispense: {args['src_plate']} col {args['src_col']} → "
+                f"{args['dst_plate']} cols {cols}  ({args['volume']} µL each){tc}"
+            )
+
+        case "serial_transfer":
+            cols = " → ".join(str(c) for c in range(args["start_col"], args["end_col"] + 1))
+            tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
+            return (
+                f"serial_transfer: {args['plate']} cols {cols}  ({args['volume']} µL steps){tc}"
+            )
+
+        case "mix_column":
+            reps = args.get("repetitions", 3)
+            return f"mix_column: {args['plate']} col {args['col']}  ({args['volume']} µL × {reps} reps)"
+
+        case "observe":
+            return "observe: read current deck state"
+
+        case _:
+            raw = json.dumps(args)
+            if len(raw) > 200:
+                raw = raw[:197] + "..."
+            return f"{name}({raw})"
+
+
 def _confirm_scripted(name: str, args: dict) -> tuple[str, dict] | None:
     """Step-through prompt for scripted replay: run, skip, replace, or quit.
 
@@ -385,10 +438,7 @@ def _confirm_scripted(name: str, args: dict) -> tuple[str, dict] | None:
     Returns (name, args) to execute (possibly replaced), None to skip.
     Raises KeyboardInterrupt on quit.
     """
-    args_str = json.dumps(args)
-    if len(args_str) > 120:
-        args_str = args_str[:117] + "..."
-    print(f"\n[next]  {name}({args_str})")
+    print(f"\n[next]  {_preview(name, args)}")
     try:
         ans = input("  Enter=run  s=skip  r=replace  q=quit: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -412,8 +462,9 @@ def _confirm_agent(name: str, args: dict) -> tuple[str, dict] | None:
     Raises UserInjection when the user wants to redirect the LLM.
     Raises KeyboardInterrupt on quit.
     """
+    print(f"\n[next]  {_preview(name, args)}")
     try:
-        ans = input("\n[next]  Enter=run  s=skip  r=replace  m=message  q=quit: ").strip().lower()
+        ans = input("  Enter=run  s=skip  r=replace  m=message  q=quit: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         raise KeyboardInterrupt
     if ans == "q":
@@ -453,7 +504,7 @@ def _clear_emptied_col(env: RobotEnv, plate_name: str, col: int) -> None:
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
-async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float) -> dict:
+async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, silent: bool = False) -> dict:
     try:
         match name:
             case "propose_prime":
@@ -461,20 +512,20 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float) -> 
                 by_plate: dict[str, list] = {}
                 for r in reagents:
                     by_plate.setdefault(r.get("plate", "source_plate"), []).append(r)
-                for plate_name, plate_reagents in by_plate.items():
-                    print(f"\n[prime]  {plate_name}:")
-                    for r in plate_reagents:
-                        parts = []
-                        if "compound" in r:
-                            conc = f" @ {r['concentration_um']} µM" if "concentration_um" in r else ""
-                            parts.append(f"{r['compound']}{conc}")
-                        if "cells" in r:
-                            density = f" @ {r['cell_density_per_ml']:.0f}/mL" if "cell_density_per_ml" in r else ""
-                            parts.append(f"{r['cells']}{density}")
-                        print(f"  col {r['col']:2d}: {', '.join(parts) or 'media'}  ({r['volume_ul']} µL/well)")
                 if env._use_hardware:
+                    for plate_name, plate_reagents in by_plate.items():
+                        print(f"\n[prime]  {plate_name}:")
+                        for r in plate_reagents:
+                            parts = []
+                            if "compound" in r:
+                                conc = f" @ {r['concentration_um']} µM" if "concentration_um" in r else ""
+                                parts.append(f"{r['compound']}{conc}")
+                            if "cells" in r:
+                                density = f" @ {r['cell_density_per_ml']:.0f}/mL" if "cell_density_per_ml" in r else ""
+                                parts.append(f"{r['cells']}{density}")
+                            print(f"  col {r['col']:2d}: {', '.join(parts) or 'media'}  ({r['volume_ul']} µL/well)")
                     input("\n  Prepare the above plates, then press Enter to continue...")
-                else:
+                elif not silent:
                     print("\n  Simulation continuing (priming set by default)")
                 # Seed the tracker unconditionally — declared volumes are the planning ground
                 # truth on both sim and hardware. On hardware the operator just confirmed they
