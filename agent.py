@@ -11,6 +11,7 @@ local models through Ollama.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -20,8 +21,6 @@ from anthropic.types import Message
 from star_sim.env import RobotEnv
 from star_sim.plate_map import Compound, WellContents, mix_contents
 from protocols.primitives import column_transfer, mix_column, multi_dispense, serial_transfer
-
-ANTHROPIC_MODEL = "claude-opus-4-8"
 
 # ---------------------------------------------------------------------------
 # Tool schemas (passed to the Claude API on every request)
@@ -181,18 +180,22 @@ OPERATION MODEL
   Volumes are in microlitres (µL). Concentrations are in micromolar (µM).
 
 RULES
-  1. Call propose_prime first to declare all initial plate contents — source_plate reagents
-     and dest_plate cell seeding. On hardware this pauses for operator plate preparation.
-  2. Compound concentrations are tracked automatically via mass balance through every
-     transfer and presented by observe(). Never compute or annotate them manually.
-  3. Cells stay where they are seeded. To move cells, first call mix_column to resuspend
+  1. When starting, give a succinct yet comprehensive overview of everything you intend to accomplish. 
+  2. Before each tool call, write a short description of what you are about to do
+     and why.
+  3. Call propose_prime first to declare all initial source plate contents. Use volumes that
+     are highly tractable to a human operator. In hardware deployment, propose_prime will
+     wait for operator confirmation.
+  4. Compound concentrations are tracked automatically via mass balance through every
+     transfer and presented by observe().
+  5. Cells stay where they are seeded. To move cells, first call mix_column to resuspend
      them, then pass transfer_cells=true to the transfer call.
-  4. Never aspirate more than a well contains; never exceed the well max volume.
+  6. Never aspirate more than a well contains; never exceed the well max volume.
      If a tool returns {"error": ...}, read the message and adjust before retrying or quitting.
-  5. Plan tip consumption up front. The rack has 12 columns (96 tips total).
+  7. Plan tip consumption up front. The rack has 12 columns (96 tips total).
      Use multi_dispense (not repeated column_transfer) when one source feeds many
      destinations. Use serial_transfer (not repeated column_transfer) for dilution chains.
-  6. When done, summarise the completed experiment and the resulting plate layout.
+  8. When done, summarise the completed experiment and the resulting plate layout.
 """
 
 # ---------------------------------------------------------------------------
@@ -282,55 +285,151 @@ SERIAL_DILUTION_SCRIPT: list[ToolCall] = [
 
 
 # ---------------------------------------------------------------------------
-# Anthropic agent (production)
+# Agent client abstraction
 # ---------------------------------------------------------------------------
 
-async def run_agent(
-    env: RobotEnv,
-    goal: str,
-    step_delay: float = 0.0,
-    confirm: bool = False,
-) -> tuple[str, list[ToolCall]]:
-    """Drive Claude to execute `goal` on the robot.
+@dataclass
+class AgentResponse:
+    text: str | None
+    # Each entry: (tool_use_id, name, args) — id only needed for result routing
+    tool_uses: list[tuple[str, str, dict]] = field(default_factory=list)
 
-    Updates env.plate_map throughout. Returns (final_text, record) where record
-    is a list of (name, args) tool calls that were actually executed.
-    Requires ANTHROPIC_API_KEY in the environment.
-    """
-    client = anthropic.AsyncAnthropic()
-    messages: list[dict] = [{"role": "user", "content": goal}]
-    record: list[ToolCall] = []
+    @property
+    def done(self) -> bool:
+        return not self.tool_uses
 
-    print("\n[user]  " + goal)
 
-    while True:
-        response: Message = await client.messages.create(
-            model=ANTHROPIC_MODEL,
+class AnthropicClient:
+    """Agent client backed by the Anthropic API."""
+
+    def __init__(self, goal: str, model: str = "claude-opus-4-8") -> None:
+        self._client = anthropic.AsyncAnthropic()
+        self._model = model
+        self._messages: list[dict] = [{"role": "user", "content": goal}]
+
+    async def complete(self) -> AgentResponse:
+        response: Message = await self._client.messages.create(
+            model=self._model,
             max_tokens=4096,
             system=SYSTEM,
             tools=TOOLS,
-            messages=messages,
+            messages=self._messages,
         )
+        self._messages.append({"role": "assistant", "content": response.content})
+        text = next((b.text for b in response.content if hasattr(b, "text") and b.text.strip()), None)
+        tool_uses = [
+            (b.id, b.name, dict(b.input))
+            for b in response.content if b.type == "tool_use"
+        ]
+        return AgentResponse(text=text, tool_uses=tool_uses)
 
-        # Display any agent messages
-        for block in response.content:
-            if hasattr(block, "text") and block.text.strip():
-                print(f"\n[agent]  {block.text.strip()}")
+    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+        self._messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(r)}
+            for tid, r in results
+        ]})
 
-        messages.append({"role": "assistant", "content": response.content})
+    def inject_user_message(self, text: str) -> None:
+        self._messages.append({"role": "user", "content": text})
 
-        if response.stop_reason != "tool_use":
-            final = next((b.text for b in response.content if hasattr(b, "text")), "NO FINAL TEXT GIVEN")
-            return final, record
 
-        # Execute tool calls, with potential user interaction
-        tool_results = []
+def _to_openai_tools(tools: list[dict]) -> list[dict]:
+    return [
+        {"type": "function", "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        }}
+        for t in tools
+    ]
+
+
+class OpenAICompatClient:
+    """Agent client for any OpenAI-compatible endpoint (Groq, Ollama, etc.)."""
+
+    def __init__(self, goal: str, model: str, base_url: str, api_key: str) -> None:
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            raise ImportError("Run: pip install openai")
+        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self._model = model
+        self._openai_tools = _to_openai_tools(TOOLS)
+        self._messages: list[dict] = [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": goal},
+        ]
+
+    async def complete(self) -> AgentResponse:
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=self._messages,
+            tools=self._openai_tools,
+            tool_choice="auto",
+        )
+        msg = response.choices[0].message
+        msg_dict = msg.model_dump(exclude_none=True)
+        msg_dict.pop("annotations", None)  # newer openai SDK adds this; not accepted by all providers
+        self._messages.append(msg_dict)
+        text = msg.content.strip() if msg.content and msg.content.strip() else None
+        tool_uses = []
+        for tc in (msg.tool_calls or []):
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+            tool_uses.append((tc.id, tc.function.name, args))
+        return AgentResponse(text=text, tool_uses=tool_uses)
+
+    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+        for tid, r in results:
+            self._messages.append({
+                "role": "tool",
+                "tool_call_id": tid,
+                "content": json.dumps(r),
+            })
+
+    def inject_user_message(self, text: str) -> None:
+        self._messages.append({"role": "user", "content": text})
+
+
+# ---------------------------------------------------------------------------
+# Unified agent loop
+# ---------------------------------------------------------------------------
+
+async def run_agent(
+    client: AnthropicClient | OpenAICompatClient,
+    env: RobotEnv,
+    step_delay: float = 0.0,
+    confirm: bool = False,
+) -> tuple[str, list[ToolCall]]:
+    """Drive an agent client to execute a goal on the robot.
+
+    Works with AnthropicClient or any OpenAICompatClient (Groq, Ollama, etc.).
+    Returns (final_text, record) where record is the list of executed tool calls.
+    """
+    record: list[ToolCall] = []
+
+    while True:
+        print(f"\n[user]  Prompting model ({client._model})...")
+        response = await client.complete()
+
+        if response.text:
+            print(f"\n[agent]  {response.text}")
+        if not confirm:
+            for _, name, args in response.tool_uses:
+                args_str = json.dumps(args)
+                if len(args_str) > 120:
+                    args_str = args_str[:117] + "..."
+                print(f"\n[tool]  {name}({args_str})")
+
+        if response.done:
+            return response.text or "", record
+
+        tool_results: list[tuple[str, dict]] = []
         injection: UserInjection | None = None
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            name, args = block.name, dict(block.input)
 
+        for tid, name, args in response.tool_uses:
             if confirm and injection is None:
                 try:
                     decision = _confirm_agent(name, args)
@@ -339,29 +438,22 @@ async def run_agent(
                     decision = None
                 if decision is None:
                     print(f"  [skipped] {name}")
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps({"skipped": True}),
-                    })
+                    tool_results.append((tid, {"skipped": True}))
                     continue
                 name, args = decision
+
             result = await _dispatch(name, args, env, step_delay, silent=confirm)
             record.append((name, args))
             summary = json.dumps(result)
             if len(summary) > 300:
                 summary = summary[:297] + "..."
             print(f"  → {summary}\n")
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": json.dumps(result),
-            })
+            tool_results.append((tid, result))
 
-        messages.append({"role": "user", "content": tool_results})
+        client.submit_tool_results(tool_results)
 
         if injection is not None:
-            messages.append({"role": "user", "content": injection.text})
+            client.inject_user_message(injection.text)
         
 
 # ---------------------------------------------------------------------------
