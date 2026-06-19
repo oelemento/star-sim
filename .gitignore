@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-.venv/
+venv/
 *.json.bak
 .env
 runs/
+.viz_cache/
