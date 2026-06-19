@@ -119,10 +119,10 @@ def _save_record(goal: str, final_text: str, record: list[ToolCall]) -> str:
     return path
 
 
-def _load_record(path: str) -> list[ToolCall]:
+def _load_record(path: str) -> tuple[str, str, list[ToolCall]]:
     with open(path) as f:
         data = json.load(f)
-    return [(name, args) for name, args in data["record"]]
+    return data["goal"], data["final_text"], [(name, args) for name, args in data["record"]]
 
 
 async def _wait_for_browser(vis: Visualizer, timeout: float = 30.0) -> bool:
@@ -169,10 +169,12 @@ async def main(
         run_record: list[ToolCall] | None = None
 
         if replay is not None:
-            script = _load_record(replay)
+            goal, final_text, script = _load_record(replay)
             print(f"\n[replay]  Loaded {len(script)} steps from {replay}")
+            print(f"\n[replay]  Goal: {goal}")
             await run_scripted(env, script, step_delay=delay, confirm=confirm)
-            print("\n[replay]  Replay completed")
+            print("\n[replay]  Replay completed, see agent message:")
+            print(f"\n[agent] {final_text}")
         elif scripted:
             await run_scripted(env, SERIAL_DILUTION_SCRIPT, step_delay=delay, confirm=confirm)
             print("\n[script]  Script completed")
