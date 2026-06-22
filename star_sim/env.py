@@ -19,6 +19,8 @@ Use as an async context manager::
 
 from __future__ import annotations
 
+from typing import Callable
+
 from .deck import DeckLayout
 from .lab import make_liquid_handler
 from .plate_map import PlateMap
@@ -35,6 +37,24 @@ class RobotEnv:
         self.layout: DeckLayout
         self.tips: TipManager
         self.plate_map: PlateMap
+        # Hooks protocol primitives call after each physical sub-step (tip
+        # pickup/drop, aspirate, dispense). Empty during normal operation —
+        # no-op unless something is listening.
+        self._movement_listeners: list[Callable[[str, dict], None]] = []
+
+    def add_movement_listener(self, fn: Callable[[str, dict], None]) -> None:
+        self._movement_listeners.append(fn)
+
+    def remove_movement_listener(self, fn: Callable[[str, dict], None]) -> None:
+        self._movement_listeners.remove(fn)
+
+    def record_movement(self, kind: str, **info) -> None:
+        # Most-recently-registered listener runs first. This lets a narrowly
+        # scoped listener (e.g. a dispatch case updating concentrations for
+        # the call it wraps) finish its update before a longer-lived listener
+        # (e.g. a replay capturing a snapshot) observes the result.
+        for fn in reversed(self._movement_listeners):
+            fn(kind, info)
 
     async def setup(self) -> None:
         self.lh, self.layout = make_liquid_handler(

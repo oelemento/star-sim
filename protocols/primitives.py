@@ -54,13 +54,17 @@ async def column_transfer(
     vols = [volume] * len(_ROWS)
     tip_col = env.tips.next_column()
     await env.lh.pick_up_tips(tip_col)
+    env.record_movement("pick_up_tips", rack=env.layout.tip_rack.name, col=env.tips.last_column)
     try:
         await env.lh.aspirate(_col(_plate(env, src_plate), src_col), vols=vols)
+        env.record_movement("aspirate", plate=src_plate, col=src_col)
         await pause()
         await env.lh.dispense(_col(_plate(env, dst_plate), dst_col), vols=vols)
+        env.record_movement("dispense", plate=dst_plate, col=dst_col)
         await pause()
     finally:
         await env.lh.discard_tips()
+        env.record_movement("discard_tips")
 
 
 async def multi_dispense(
@@ -88,14 +92,18 @@ async def multi_dispense(
 
     tip_col = env.tips.next_column()
     await env.lh.pick_up_tips(tip_col)
+    env.record_movement("pick_up_tips", rack=env.layout.tip_rack.name, col=env.tips.last_column)
     try:
         for col in dst_cols:
             await env.lh.aspirate(_col(src, src_col), vols=vols)
+            env.record_movement("aspirate", plate=src_plate, col=src_col)
             await pause()
             await env.lh.dispense(_col(dst, col), vols=vols)
+            env.record_movement("dispense", plate=dst_plate, col=col)
             await pause()
     finally:
         await env.lh.discard_tips()
+        env.record_movement("discard_tips")
 
 
 async def mix_column(
@@ -119,14 +127,18 @@ async def mix_column(
 
     tip_col = env.tips.next_column()
     await env.lh.pick_up_tips(tip_col)
+    env.record_movement("pick_up_tips", rack=env.layout.tip_rack.name, col=env.tips.last_column)
     try:
         for _ in range(repetitions):
             await env.lh.aspirate(_col(p, col), vols=vols)
+            env.record_movement("aspirate", plate=plate, col=col)
             await pause()
             await env.lh.dispense(_col(p, col), vols=vols)
+            env.record_movement("dispense", plate=plate, col=col)
             await pause()
     finally:
         await env.lh.discard_tips()
+        env.record_movement("discard_tips")
 
 
 async def serial_transfer(
@@ -154,11 +166,15 @@ async def serial_transfer(
 
     tip_col = env.tips.next_column()
     await env.lh.pick_up_tips(tip_col)
+    env.record_movement("pick_up_tips", rack=env.layout.tip_rack.name, col=env.tips.last_column)
     try:
         for k in range(start_col, end_col):
             await env.lh.aspirate(_col(p, k), vols=vols)
+            env.record_movement("aspirate", plate=plate, col=k)
             await pause()
             await env.lh.dispense(_col(p, k + 1), vols=vols)
+            env.record_movement("dispense", plate=plate, col=k + 1)
             await pause()
     finally:
         await env.lh.discard_tips()
+        env.record_movement("discard_tips")

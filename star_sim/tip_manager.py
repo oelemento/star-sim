@@ -28,6 +28,7 @@ class TipManager:
     def __init__(self, rack: TipRack) -> None:
         self._rack = rack
         self._cursor = 0  # next column index (0-based)
+        self.last_column: int | None = None  # column number (1-based) returned by the last next_column() call
 
     @property
     def remaining(self) -> int:
@@ -54,6 +55,7 @@ class TipManager:
             col_num = self._cursor + 1
             self._cursor += 1
             if self._column_full(col_num):
+                self.last_column = col_num
                 return self._rack[f"A{col_num}:H{col_num}"]
         raise OutOfTipsError(f"Tip rack '{self._rack.name}' is exhausted")
 

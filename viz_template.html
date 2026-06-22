@@ -188,6 +188,7 @@
       <div id="controls">
         <button id="btn-back">&#9664;</button>
         <button id="btn-play">&#9654; Play</button>
+        <button id="btn-step-anim">&#9654;&#9614; Step</button>
         <button id="btn-fwd">&#9654;|</button>
       </div>
       <input id="slider" type="range" min="0" max="__MAX_STEP__" value="0">
@@ -371,18 +372,18 @@
     // ---------------------------------------------------------------------------
     // Per-frame state updates
     // ---------------------------------------------------------------------------
-    function updateWells(frame) {
+    function updateWells(snapshot) {
       for (const [key, mesh] of Object.entries(wellMeshes)) {
         const [plate, id] = key.split(':');
-        const entry = frame.snapshot[plate]?.[id];
+        const entry = snapshot[plate]?.[id];
         mesh.material.color.copy(colorForWell(entry));
       }
     }
 
-    function updateTipSpots(frame) {
+    function updateTipSpots(snapshot) {
       for (const [key, mesh] of Object.entries(tipMeshes)) {
         const [rack, pos] = key.split(':');
-        mesh.visible = !!(frame.snapshot.tip_racks?.[rack]?.[pos]);
+        mesh.visible = !!(snapshot.tip_racks?.[rack]?.[pos]);
       }
     }
 
@@ -403,25 +404,13 @@
       return centerY;
     }
 
-    const TRANSFER_TOOLS = new Set(['column_transfer', 'multi_dispense', 'serial_transfer',
-      'mix_column', 'propose_prime']);
-
-    function updatePipetteTips(frame, showTips) {
-      const show = showTips ?? TRANSFER_TOOLS.has(frame.tool);
-      tipOnPipette.forEach(m => { m.visible = show; });
-    }
-
-    function updateState(frame, showTips) {
-      updateWells(frame);
-      updateTipSpots(frame);
-      updatePipetteTips(frame, showTips);
-    }
-
     // ---------------------------------------------------------------------------
     // Pipette animation
     // ---------------------------------------------------------------------------
-    let animState = null;  // {fromX, fromZ, toX, toZ, startMs, durationMs, onDone, showTips}
+    let animState = null;  // {fromX, fromZ, toX, toZ, startMs, durationMs, onDone}
 
+    // showTips: true/false to force tip visibility for the duration of this leg,
+    // or null/undefined to leave whatever visibility is already set untouched.
     function startAnim(toPos, onDone, showTips) {
       if (!toPos) { onDone?.(); return; }
 
@@ -430,13 +419,13 @@
       const toX = toPos.x;
       const toZ = -(centerY ?? toPos.y);
 
-      tipOnPipette.forEach(m => { m.visible = !!(showTips); });
+      if (showTips != null) tipOnPipette.forEach(m => { m.visible = showTips; });
 
       animState = {
         fromX: channelGroup.position.x, fromZ: channelGroup.position.z,
         toX, toZ,
         startMs: performance.now(), durationMs: 550,
-        onDone, showTips,
+        onDone,
       };
     }
 
@@ -475,26 +464,50 @@
     let isPlaying = false;
     let playTimeout = null;
 
+    // Animate sequentially through a frame's recorded sub-movements (tip pickup,
+    // aspirate, dispense, discard …), each ending with its own snapshot/tip-state
+    // update, so the pipette visibly travels through every physical sub-step
+    // instead of teleporting straight to the step's final position.
+    function playMovements(frame, onDone) {
+      const moves = (frame.movements && frame.movements.length)
+        ? frame.movements
+        : [{ pipette_pos: frame.pipette_pos, show_tips: null, snapshot: frame.snapshot }];
+
+      let mi = 0;
+      function step() {
+        if (mi >= moves.length) { onDone?.(); return; }
+        const mv = moves[mi++];
+        startAnim(mv.pipette_pos, () => {
+          if (mv.show_tips != null) tipOnPipette.forEach(m => { m.visible = mv.show_tips; });
+          updateWells(mv.snapshot);
+          updateTipSpots(mv.snapshot);
+          if (mi < moves.length) playTimeout = setTimeout(step, 120);
+          else step();
+        }, null);
+      }
+      step();
+    }
+
     function goToFrame(idx, animate, onDone) {
       currentFrameIdx = idx;
       document.getElementById('slider').value = idx;
       const frame = FRAMES[idx];
-      const showTips = TRANSFER_TOOLS.has(frame.tool);
+      updateUI(frame);
 
-      if (animate && frame.pipette_pos) {
-        startAnim(frame.pipette_pos, () => {
-          updateState(frame, false);  // tips now gone (step complete)
-          updateUI(frame);
-          onDone?.();
-        }, showTips);
+      if (animate) {
+        playMovements(frame, () => onDone?.());
       } else {
         animState = null;
+        if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
         snapPipette(frame.pipette_pos);
-        updateState(frame, false);
-        updateUI(frame);
+        updateWells(frame.snapshot);
+        updateTipSpots(frame.snapshot);
+        tipOnPipette.forEach(m => { m.visible = false; });
         onDone?.();
       }
     }
+
+    const STEP_PAUSE_MS = 700;  // pause between steps while playing
 
     function stepPlay() {
       if (!isPlaying) return;
@@ -505,7 +518,7 @@
         return;
       }
       goToFrame(next, true, () => {
-        if (isPlaying) playTimeout = setTimeout(stepPlay, 180);
+        if (isPlaying) playTimeout = setTimeout(stepPlay, STEP_PAUSE_MS);
       });
     }
 
@@ -519,6 +532,15 @@
         playTimeout = setTimeout(stepPlay, 0);
       }
       updatePlayBtn();
+    }
+
+    // Animate exactly one step forward, then stay paused — no need to hit
+    // Play and immediately Pause just to watch a single step's movement.
+    function playOneStep() {
+      isPlaying = false;
+      if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
+      updatePlayBtn();
+      if (currentFrameIdx < FRAMES.length - 1) goToFrame(currentFrameIdx + 1, true);
     }
 
     function stepBack() {
@@ -695,6 +717,7 @@
       // Event listeners
       document.getElementById('btn-play').addEventListener('click', togglePlay);
       document.getElementById('btn-back').addEventListener('click', stepBack);
+      document.getElementById('btn-step-anim').addEventListener('click', playOneStep);
       document.getElementById('btn-fwd').addEventListener('click', stepForward);
       document.getElementById('slider').addEventListener('input', e => {
         isPlaying = false;

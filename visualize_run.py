@@ -154,10 +154,20 @@ def _geometry(env: RobotEnv) -> dict:
         if tip_rack_box else {"x": bounds["min_x"], "y": bounds["min_y"], "plate": None}
     )
 
+    # The trash area has size_x=0 (a degenerate line, not a box) so it never makes
+    # it into `boxes` — capture its centre separately for discard-tip animation.
+    trash_res = env.layout.deck.get_trash_area()
+    trash_loc = trash_res.get_absolute_location()
+    trash_pos = {
+        "x": trash_loc.x + trash_res.get_size_x() / 2,
+        "y": trash_loc.y + trash_res.get_size_y() / 2,
+        "plate": None,
+    }
+
     return {
         "boxes": boxes, "wells": wells, "tip_spots": tip_spots,
         "bounds": bounds, "rails": rails, "tip_rack_names": tip_rack_names,
-        "plate_row_ys": plate_row_ys, "home_pos": home_pos,
+        "plate_row_ys": plate_row_ys, "home_pos": home_pos, "trash_pos": trash_pos,
     }
 
 
@@ -174,23 +184,31 @@ def _col_center(plate_name: str, col: int, geometry: dict) -> dict | None:
     }
 
 
-def _pipette_pos(name: str, args: dict, geometry: dict) -> dict | None:
-    match name:
-        case "propose_prime":
-            reagents = args.get("reagents", [])
-            if reagents:
-                r = reagents[0]
-                return _col_center(r.get("plate", "source_plate"), r.get("col", 1), geometry)
-        case "column_transfer":
-            return _col_center(args["dst_plate"], args["dst_col"], geometry)
-        case "multi_dispense":
-            cols = args.get("dst_cols", [])
-            if cols:
-                return _col_center(args["dst_plate"], cols[-1], geometry)
-        case "serial_transfer":
-            return _col_center(args["plate"], args["end_col"], geometry)
-        case "mix_column":
-            return _col_center(args["plate"], args["col"], geometry)
+def _tip_col_center(rack_name: str, col: int, geometry: dict) -> dict | None:
+    col_str = str(col)
+    ps = [s for s in geometry["tip_spots"]
+          if s["rack"] == rack_name and s["id"][1:] == col_str]
+    if not ps:
+        return None
+    return {
+        "x": sum(s["x"] + s["w"] / 2 for s in ps) / len(ps),
+        "y": sum(s["y"] + s["h"] / 2 for s in ps) / len(ps),
+        "plate": None,
+    }
+
+
+# Whether tips become visible (True), get discarded (False), or are unaffected
+# (omitted) on the pipette after each kind of recorded movement.
+_SHOW_TIPS_AFTER = {"pick_up_tips": True, "discard_tips": False}
+
+
+def _movement_target(kind: str, info: dict, geometry: dict) -> dict | None:
+    if kind == "pick_up_tips":
+        return _tip_col_center(info["rack"], info["col"], geometry)
+    if kind == "discard_tips":
+        return geometry["trash_pos"]
+    if kind in ("aspirate", "dispense"):
+        return _col_center(info["plate"], info["col"], geometry)
     return None
 
 
@@ -233,15 +251,32 @@ async def _replay(record: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
         geometry = _geometry(env)
         tip_rack_names = geometry["tip_rack_names"]
         frames = [{"step": -1, "tool": "initial", "preview": "",
-                   "pipette_pos": geometry["home_pos"],
+                   "pipette_pos": geometry["home_pos"], "movements": [],
                    "snapshot": _snapshot(env, tip_rack_names)}]
+
         for i, (name, args) in enumerate(record):
-            result = await _dispatch(name, args, env, step_delay=0.0, silent=True)
+            movements: list[dict] = []
+
+            def on_movement(kind: str, info: dict) -> None:
+                movements.append({
+                    "kind": kind,
+                    "pipette_pos": _movement_target(kind, info, geometry),
+                    "show_tips": _SHOW_TIPS_AFTER.get(kind),
+                    "snapshot": _snapshot(env, tip_rack_names),
+                })
+
+            env.add_movement_listener(on_movement)
+            try:
+                result = await _dispatch(name, args, env, step_delay=0.0, silent=True)
+            finally:
+                env.remove_movement_listener(on_movement)
+
             frames.append({
                 "step": i,
                 "tool": name,
                 "preview": _preview(name, args),
-                "pipette_pos": _pipette_pos(name, args, geometry),
+                "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
+                "movements": movements,
                 "error": result.get("error"),
                 "snapshot": _snapshot(env, tip_rack_names),
             })

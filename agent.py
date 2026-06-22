@@ -655,13 +655,22 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                 volume = args["volume"]
                 tc = args.get("transfer_cells", False)
                 dst_pre = _col_vols(env, dst_plate, dst_col)
-                await column_transfer(env, src_plate, src_col, dst_plate, dst_col, volume, step_delay=step_delay)
-                for row in "ABCDEFGH":
-                    env.plate_map.set_well(dst_plate, f"{row}{dst_col}", mix_contents(
-                        env.plate_map.get_well(src_plate, f"{row}{src_col}"), volume,
-                        env.plate_map.get_well(dst_plate, f"{row}{dst_col}"), dst_pre[row],
-                        transfer_cells=tc,
-                    ))
+
+                def on_movement(kind: str, info: dict) -> None:
+                    if kind != "dispense" or info.get("plate") != dst_plate or info.get("col") != dst_col:
+                        return
+                    for row in "ABCDEFGH":
+                        env.plate_map.set_well(dst_plate, f"{row}{dst_col}", mix_contents(
+                            env.plate_map.get_well(src_plate, f"{row}{src_col}"), volume,
+                            env.plate_map.get_well(dst_plate, f"{row}{dst_col}"), dst_pre[row],
+                            transfer_cells=tc,
+                        ))
+
+                env.add_movement_listener(on_movement)
+                try:
+                    await column_transfer(env, src_plate, src_col, dst_plate, dst_col, volume, step_delay=step_delay)
+                finally:
+                    env.remove_movement_listener(on_movement)
                 _clear_emptied_col(env, src_plate, src_col)
                 return {"ok": True}
 
@@ -671,14 +680,23 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                 volume = args["volume"]
                 tc = args.get("transfer_cells", False)
                 dst_pre = {col: _col_vols(env, dst_plate, col) for col in dst_cols}
-                await multi_dispense(env, src_plate, src_col, dst_plate, dst_cols, volume, step_delay=step_delay)
-                for col in dst_cols:
+
+                def on_movement(kind: str, info: dict) -> None:
+                    col = info.get("col")
+                    if kind != "dispense" or info.get("plate") != dst_plate or col not in dst_pre:
+                        return
                     for row in "ABCDEFGH":
                         env.plate_map.set_well(dst_plate, f"{row}{col}", mix_contents(
                             env.plate_map.get_well(src_plate, f"{row}{src_col}"), volume,
                             env.plate_map.get_well(dst_plate, f"{row}{col}"), dst_pre[col][row],
                             transfer_cells=tc,
                         ))
+
+                env.add_movement_listener(on_movement)
+                try:
+                    await multi_dispense(env, src_plate, src_col, dst_plate, dst_cols, volume, step_delay=step_delay)
+                finally:
+                    env.remove_movement_listener(on_movement)
                 _clear_emptied_col(env, src_plate, src_col)
                 return {"ok": True}
 
@@ -694,32 +712,42 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                 start_col, end_col = args["start_col"], args["end_col"]
                 volume = args["volume"]
                 tc = args.get("transfer_cells", False)
-                pre_vols = {
+
+                local_vols = {
                     (row, col): _col_vols(env, plate_name, col)[row]
                     for col in range(start_col, end_col + 1)
                     for row in "ABCDEFGH"
                 }
-                await serial_transfer(env, plate_name, start_col, end_col, volume, step_delay=step_delay)
                 local: dict[tuple, WellContents | None] = {
-                    k: env.plate_map.get_well(plate_name, f"{k[0]}{k[1]}") for k in pre_vols
+                    k: env.plate_map.get_well(plate_name, f"{k[0]}{k[1]}") for k in local_vols
                 }
-                local_vols = dict(pre_vols)
-                for col in range(start_col, end_col):
+
+                def on_movement(kind: str, info: dict) -> None:
+                    if kind != "dispense" or info.get("plate") != plate_name:
+                        return
+                    dst_col = info.get("col")
+                    src_col = dst_col - 1
+                    if not (start_col <= src_col < end_col):
+                        return
                     for row in "ABCDEFGH":
-                        src_k, dst_k = (row, col), (row, col + 1)
+                        src_k, dst_k = (row, src_col), (row, dst_col)
                         local[dst_k] = mix_contents(
                             local[src_k], volume, local[dst_k], local_vols[dst_k],
                             transfer_cells=tc,
                         )
                         local_vols[src_k] -= volume
                         local_vols[dst_k] += volume
-                for (row, col), contents in local.items():
-                    if contents is not None:
-                        well_id = f"{row}{col}"
-                        if local_vols[(row, col)] <= 0:
+                        well_id = f"{row}{dst_col}"
+                        if local_vols[dst_k] <= 0:
                             env.plate_map.set_well(plate_name, well_id, WellContents())
                         else:
-                            env.plate_map.set_well(plate_name, well_id, contents)
+                            env.plate_map.set_well(plate_name, well_id, local[dst_k])
+
+                env.add_movement_listener(on_movement)
+                try:
+                    await serial_transfer(env, plate_name, start_col, end_col, volume, step_delay=step_delay)
+                finally:
+                    env.remove_movement_listener(on_movement)
                 return {"ok": True}
 
             case _:
