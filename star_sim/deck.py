@@ -22,7 +22,7 @@ class DeckLayout:
     string lookup. Every field is a live PyLabRobot resource.
     """
 
-    deck: STARLetDeck
+    deck: plr.hamilton.HamiltonSTARDeck
     tip_rack: plr.TipRack
     source_plate: plr.Plate
     dest_plate: plr.Plate

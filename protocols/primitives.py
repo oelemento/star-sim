@@ -60,7 +60,7 @@ async def column_transfer(
         await env.lh.dispense(_col(_plate(env, dst_plate), dst_col), vols=vols)
         await pause()
     finally:
-        await env.lh.drop_tips(tip_col)
+        await env.lh.discard_tips()
 
 
 async def multi_dispense(
@@ -95,7 +95,7 @@ async def multi_dispense(
             await env.lh.dispense(_col(dst, col), vols=vols)
             await pause()
     finally:
-        await env.lh.drop_tips(tip_col)
+        await env.lh.discard_tips()
 
 
 async def mix_column(
@@ -126,7 +126,7 @@ async def mix_column(
             await env.lh.dispense(_col(p, col), vols=vols)
             await pause()
     finally:
-        await env.lh.drop_tips(tip_col)
+        await env.lh.discard_tips()
 
 
 async def serial_transfer(
@@ -161,4 +161,4 @@ async def serial_transfer(
             await env.lh.dispense(_col(p, k + 1), vols=vols)
             await pause()
     finally:
-        await env.lh.drop_tips(tip_col)
+        await env.lh.discard_tips()
