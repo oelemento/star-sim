@@ -244,13 +244,16 @@ def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
     return snap
 
 
-async def _replay(record: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
+async def _replay(
+    record: list[tuple[str, dict]], messages: list[str | None] | None = None,
+) -> tuple[dict, list[dict]]:
+    messages = messages or [None] * len(record)
     env = RobotEnv(use_hardware=False)
     await env.setup()
     try:
         geometry = _geometry(env)
         tip_rack_names = geometry["tip_rack_names"]
-        frames = [{"step": -1, "tool": "initial", "preview": "",
+        frames = [{"step": -1, "tool": "initial", "preview": "", "message": None,
                    "pipette_pos": geometry["home_pos"], "movements": [],
                    "snapshot": _snapshot(env, tip_rack_names)}]
 
@@ -275,6 +278,7 @@ async def _replay(record: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
                 "step": i,
                 "tool": name,
                 "preview": _preview(name, args),
+                "message": messages[i] if i < len(messages) else None,
                 "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
                 "movements": movements,
                 "error": result.get("error"),
@@ -346,8 +350,9 @@ def main() -> None:
     with open(args.run_path) as f:
         data = json.load(f)
     record = [(name, call_args) for name, call_args in data["record"]]
+    messages = data.get("messages")
 
-    geometry, frames = asyncio.run(_replay(record))
+    geometry, frames = asyncio.run(_replay(record, messages))
 
     title = os.path.basename(args.run_path)
     js    = _fetch_js()

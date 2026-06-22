@@ -402,13 +402,17 @@ async def run_agent(
     env: RobotEnv,
     step_delay: float = 0.0,
     confirm: bool = False,
-) -> tuple[str, list[ToolCall]]:
+) -> tuple[str, list[ToolCall], list[str | None]]:
     """Drive an agent client to execute a goal on the robot.
 
     Works with AnthropicClient or any OpenAICompatClient (Groq, Ollama, etc.).
-    Returns (final_text, record) where record is the list of executed tool calls.
+    Returns (final_text, record, messages) where record is the list of executed
+    tool calls and messages[i] is the agent's explanatory text (if any) from the
+    turn that produced record[i] — the same text repeats across every tool call
+    issued in one turn, since one explanation can cover a batch of actions.
     """
     record: list[ToolCall] = []
+    messages: list[str | None] = []
 
     while True:
         print(f"\n[user]  Prompting model ({client._model})...")
@@ -424,7 +428,7 @@ async def run_agent(
                 print(f"\n[tool]  {name}({args_str})")
 
         if response.done:
-            return response.text or "", record
+            return response.text or "", record, messages
 
         tool_results: list[tuple[str, dict]] = []
         injection: UserInjection | None = None
@@ -444,6 +448,7 @@ async def run_agent(
 
             result = await _dispatch(name, args, env, step_delay, silent=confirm)
             record.append((name, args))
+            messages.append(response.text)
             summary = json.dumps(result)
             if len(summary) > 300:
                 summary = summary[:297] + "..."

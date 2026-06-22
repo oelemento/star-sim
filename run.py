@@ -109,13 +109,16 @@ def _build_client(
     )
 
 
-def _save_record(goal: str, final_text: str, record: list[ToolCall]) -> str:
+def _save_record(
+    goal: str, final_text: str, record: list[ToolCall], messages: list[str | None],
+) -> str:
     os.makedirs("runs", exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     path = f"runs/{ts}.json"
     with open(path, "w") as f:
         json.dump({"goal": goal, "final_text": final_text,
-                   "record": [[name, args] for name, args in record]}, f, indent=2)
+                   "record": [[name, args] for name, args in record],
+                   "messages": messages}, f, indent=2)
     return path
 
 
@@ -181,9 +184,9 @@ async def main(
         else:
             print(f"\n[user]  Goal: {goal}")
             client = _build_client(provider, goal, model, base_url)
-            final_text, run_record = await run_agent(client, env, step_delay=delay, confirm=confirm)
+            final_text, run_record, run_messages = await run_agent(client, env, step_delay=delay, confirm=confirm)
             if record and run_record is not None:
-                path = _save_record(goal, final_text, run_record)
+                path = _save_record(goal, final_text, run_record, run_messages)
                 print(f"\n[record]  Saved {len(run_record)} steps to {path}")
 
         print("\n" + "─" * 60)
