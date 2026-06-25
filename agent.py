@@ -214,7 +214,7 @@ async def run_scripted(
     script: list[ToolCall],
     step_delay: float = 0.0,
     confirm: bool = False,
-    on_step: Callable[[list[ToolCall], list[str | None]], Awaitable[None]] | None = None,
+    on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
 ) -> None:
     """Execute a pre-written sequence of tool calls without any LLM.
 
@@ -224,11 +224,11 @@ async def run_scripted(
     Set confirm=True to pause before each tool call (step-through mode).
     Raises RuntimeError immediately on any tool error so the problem is visible.
 
-    on_step, if given, is awaited after every executed tool call — same contract
-    as run_agent's on_step — so a live visualizer updates after each dispatch,
-    not just once at the end.
+    on_step, if given, is awaited after every executed tool call with
+    (name, args, message, result) — same contract as run_agent's on_step — so a
+    live visualizer can update after each dispatch, not just once at the end.
+    Scripted runs have no agent text, so message is always None.
     """
-    executed: list[ToolCall] = []
     for name, args in script:
         if confirm:
             decision = _confirm_scripted(name, args)
@@ -247,9 +247,8 @@ async def run_scripted(
             summary = summary[:297] + "..."
         print(f"  → {summary}")
 
-        executed.append((name, args))
         if on_step:
-            await on_step(executed, [None] * len(executed))
+            await on_step(name, args, None, result)
 
         if "error" in result:
             raise RuntimeError(f"Tool '{name}' failed: {result['error']}")
@@ -414,7 +413,7 @@ async def run_agent(
     env: RobotEnv,
     step_delay: float = 0.0,
     confirm: bool = False,
-    on_step: Callable[[list[ToolCall], list[str | None]], Awaitable[None]] | None = None,
+    on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCall], list[str | None]]:
     """Drive an agent client to execute a goal on the robot.
 
@@ -424,9 +423,10 @@ async def run_agent(
     turn that produced record[i] — the same text repeats across every tool call
     issued in one turn, since one explanation can cover a batch of actions.
 
-    on_step, if given, is awaited after every executed tool call with the
-    (growing) record/messages lists so far — e.g. for a live visualizer that
-    regenerates its view after each step.
+    on_step, if given, is awaited after every executed tool call with
+    (name, args, message, result) for that single call — e.g. for a live
+    visualizer to fold into its own accumulated state, without re-deriving
+    anything from the full history.
     """
     record: list[ToolCall] = []
     messages: list[str | None] = []
@@ -473,7 +473,7 @@ async def run_agent(
             tool_results.append((tid, result))
 
             if on_step:
-                await on_step(record, messages)
+                await on_step(name, args, response.text, result)
 
         client.submit_tool_results(tool_results)
 

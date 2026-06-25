@@ -48,7 +48,7 @@ from agent import (
     run_agent, run_scripted,
 )
 from star_sim import RobotEnv
-from visualize_run import _fetch_js, _replay, render_html
+from visualize_run import LiveCapture, _fetch_js, _geometry, render_html
 
 
 def _serve_dir(directory: str) -> tuple[str, ThreadingHTTPServer]:
@@ -170,7 +170,7 @@ async def main(
     await env.setup()
 
     live_server = None
-    write_frames = None
+    live_capture: LiveCapture | None = None
     if visualize:
         if use_hardware:
             raise SystemExit("--visualize is for simulation only; drop --hardware.")
@@ -179,24 +179,25 @@ async def main(
         html_path = os.path.join("runs", "_live.viz.html")
         frames_path = os.path.join("runs", frames_name)
 
-        async def write_frames(
-            record_so_far: list[ToolCall], messages_so_far: list[str | None],
-            final: str | None = None,
-        ) -> None:
-            _, frames = await _replay(record_so_far, messages_so_far, final)
+        # Listens to the real env's own movement events as they actually happen —
+        # no second env, no re-dispatching, no duplicate backend chatter. The
+        # state needed for each frame was already computed once by the real run.
+        geometry = _geometry(env)
+        live_capture = LiveCapture(env, geometry)
+
+        def write_frames_now() -> None:
             with open(frames_path, "w") as f:
-                json.dump(frames, f)
+                json.dump(live_capture.frames, f)
 
         # The HTML (with the bundled Three.js payload) is written once; only the
         # small frames.json is rewritten per step, and the open tab polls that —
         # no page reload, so the user can freely scrub through history without
         # ever getting yanked back to the live edge.
-        geometry, initial_frames = await _replay([], [])
-        html = render_html(goal, geometry, initial_frames, "live run", _fetch_js(),
+        html = render_html(goal, geometry, live_capture.frames, "live run", _fetch_js(),
                             live=True, frames_url=frames_name)
         with open(html_path, "w") as f:
             f.write(html)
-        await write_frames([], [])
+        write_frames_now()
 
         serve_url, live_server = _serve_dir("runs")
         webbrowser.open(f"{serve_url}/_live.viz.html")
@@ -204,11 +205,12 @@ async def main(
         if delay == 0.0:
             delay = 0.5
 
-    async def on_step(record_so_far: list[ToolCall], messages_so_far: list[str | None]) -> None:
-        if write_frames:
-            await write_frames(record_so_far, messages_so_far)
+    async def on_step(name: str, args: dict, message: str | None, result: dict) -> None:
+        if live_capture is not None:
+            live_capture.record_step(name, args, message, result.get("error"))
+            write_frames_now()
 
-    live_hook = on_step if write_frames else None
+    live_hook = on_step if live_capture is not None else None
 
     try:
         run_record: list[ToolCall] | None = None
@@ -220,13 +222,12 @@ async def main(
             await run_scripted(env, script, step_delay=delay, confirm=confirm, on_step=live_hook)
             print("\n[replay]  Replay completed, see agent message:")
             print(f"\n[agent] {final_text}")
-            if write_frames:
-                await write_frames(script, [None] * len(script), final_text)
+            if live_capture is not None:
+                live_capture.finish(final_text)
+                write_frames_now()
         elif scripted:
             await run_scripted(env, SERIAL_DILUTION_SCRIPT, step_delay=delay, confirm=confirm, on_step=live_hook)
             print("\n[script]  Script completed")
-            if write_frames:
-                await write_frames(SERIAL_DILUTION_SCRIPT, [None] * len(SERIAL_DILUTION_SCRIPT))
         else:
             print(f"\n[user]  Goal: {goal}")
             client = _build_client(provider, goal, model, base_url)
@@ -234,8 +235,9 @@ async def main(
             final_text, run_record, run_messages = await run_agent(
                 client, env, step_delay=delay, confirm=confirm, on_step=live_hook,
             )
-            if write_frames:
-                await write_frames(run_record, run_messages, final_text)
+            if live_capture is not None:
+                live_capture.finish(final_text)
+                write_frames_now()
             if record and run_record is not None:
                 path = _save_record(goal, final_text, run_record, run_messages)
                 print(f"\n[record]  Saved {len(run_record)} steps to {path}")
@@ -250,6 +252,8 @@ async def main(
     finally:
         if live_server is not None:
             live_server.shutdown()
+        if live_capture is not None:
+            live_capture.close()
         await env.teardown()
 
 

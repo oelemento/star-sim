@@ -244,6 +244,58 @@ def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
     return snap
 
 
+async def _replay_one(
+    env: RobotEnv, geometry: dict, tip_rack_names: list[str],
+    step_idx: int, name: str, args: dict, message: str | None,
+) -> dict | None:
+    """Execute one already-recorded tool call against env and build its frame.
+
+    Returns None for tool calls that shouldn't appear as a step (currently just
+    observe() — a read-only query that never moves anything or changes state).
+    """
+    movements: list[dict] = []
+
+    def on_movement(kind: str, info: dict) -> None:
+        movements.append({
+            "kind": kind,
+            "pipette_pos": _movement_target(kind, info, geometry),
+            "show_tips": _SHOW_TIPS_AFTER.get(kind),
+            "snapshot": _snapshot(env, tip_rack_names),
+        })
+
+    env.add_movement_listener(on_movement)
+    try:
+        result = await _dispatch(name, args, env, step_delay=0.0, silent=True)
+    finally:
+        env.remove_movement_listener(on_movement)
+
+    if name == "observe":
+        return None
+
+    return {
+        "step": step_idx,
+        "tool": name,
+        "preview": _preview(name, args),
+        "message": message,
+        "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
+        "movements": movements,
+        "error": result.get("error"),
+        "snapshot": _snapshot(env, tip_rack_names),
+    }
+
+
+def _initial_frame(geometry: dict, env: RobotEnv, tip_rack_names: list[str]) -> dict:
+    return {"step": -1, "tool": "initial", "preview": "", "message": None,
+            "pipette_pos": geometry["home_pos"], "movements": [],
+            "snapshot": _snapshot(env, tip_rack_names)}
+
+
+def _done_frame(record_len: int, env: RobotEnv, tip_rack_names: list[str], final_text: str) -> dict:
+    return {"step": record_len, "tool": "done", "preview": "", "message": final_text,
+            "pipette_pos": None, "movements": [],
+            "snapshot": _snapshot(env, tip_rack_names)}
+
+
 async def _replay(
     record: list[tuple[str, dict]], messages: list[str | None] | None = None,
     final_text: str | None = None,
@@ -254,52 +306,76 @@ async def _replay(
     try:
         geometry = _geometry(env)
         tip_rack_names = geometry["tip_rack_names"]
-        frames = [{"step": -1, "tool": "initial", "preview": "", "message": None,
-                   "pipette_pos": geometry["home_pos"], "movements": [],
-                   "snapshot": _snapshot(env, tip_rack_names)}]
+        frames = [_initial_frame(geometry, env, tip_rack_names)]
 
         for i, (name, args) in enumerate(record):
-            movements: list[dict] = []
-
-            def on_movement(kind: str, info: dict) -> None:
-                movements.append({
-                    "kind": kind,
-                    "pipette_pos": _movement_target(kind, info, geometry),
-                    "show_tips": _SHOW_TIPS_AFTER.get(kind),
-                    "snapshot": _snapshot(env, tip_rack_names),
-                })
-
-            env.add_movement_listener(on_movement)
-            try:
-                result = await _dispatch(name, args, env, step_delay=0.0, silent=True)
-            finally:
-                env.remove_movement_listener(on_movement)
-
-            # observe() is a read-only query the agent uses to plan — it never
-            # moves anything or changes deck state, so it's not a meaningful
-            # step to show in the viewer.
-            if name == "observe":
-                continue
-
-            frames.append({
-                "step": i,
-                "tool": name,
-                "preview": _preview(name, args),
-                "message": messages[i] if i < len(messages) else None,
-                "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
-                "movements": movements,
-                "error": result.get("error"),
-                "snapshot": _snapshot(env, tip_rack_names),
-            })
+            frame = await _replay_one(
+                env, geometry, tip_rack_names, i, name, args,
+                messages[i] if i < len(messages) else None,
+            )
+            if frame is not None:
+                frames.append(frame)
         if final_text:
-            frames.append({
-                "step": len(record), "tool": "done", "preview": "", "message": final_text,
-                "pipette_pos": None, "movements": [],
-                "snapshot": _snapshot(env, tip_rack_names),
-            })
+            frames.append(_done_frame(len(record), env, tip_rack_names, final_text))
     finally:
         await env.teardown()
     return geometry, frames
+
+
+class LiveCapture:
+    """Builds the same frame structure as _replay(), but by listening to a live
+    RobotEnv's own movement events as they really happen — no second env, no
+    re-dispatching, no duplicate ChatterboxBackend chatter. The state needed to
+    render each step (positions, snapshots) was already computed once by the
+    real dispatch; this just packages it instead of recomputing it.
+
+    Usage: construct once right after the real env's setup(), then call
+    record_step() after every real _dispatch() call, and finish() once at the
+    end. close() detaches the listener (does not touch the env's lifecycle).
+    """
+
+    def __init__(self, env: RobotEnv, geometry: dict) -> None:
+        self.env = env
+        self.geometry = geometry
+        self.tip_rack_names = geometry["tip_rack_names"]
+        self.frames: list[dict] = [_initial_frame(geometry, env, self.tip_rack_names)]
+        self._pending: list[dict] = []
+        self._step_idx = 0
+        env.add_movement_listener(self._on_movement)
+
+    def _on_movement(self, kind: str, info: dict) -> None:
+        self._pending.append({
+            "kind": kind,
+            "pipette_pos": _movement_target(kind, info, self.geometry),
+            "show_tips": _SHOW_TIPS_AFTER.get(kind),
+            "snapshot": _snapshot(self.env, self.tip_rack_names),
+        })
+
+    def record_step(self, name: str, args: dict, message: str | None, error: str | None) -> None:
+        movements, self._pending = self._pending, []
+        step_idx, self._step_idx = self._step_idx, self._step_idx + 1
+        if name == "observe":
+            return
+        self.frames.append({
+            "step": step_idx,
+            "tool": name,
+            "preview": _preview(name, args),
+            "message": message,
+            "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
+            "movements": movements,
+            "error": error,
+            "snapshot": _snapshot(self.env, self.tip_rack_names),
+        })
+
+    def finish(self, final_text: str | None) -> None:
+        if final_text:
+            self.frames.append(_done_frame(self._step_idx, self.env, self.tip_rack_names, final_text))
+
+    def close(self) -> None:
+        self.env.remove_movement_listener(self._on_movement)
+
+    async def teardown(self) -> None:
+        await self.env.teardown()
 
 
 # ---------------------------------------------------------------------------
