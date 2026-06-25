@@ -246,6 +246,7 @@ def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
 
 async def _replay(
     record: list[tuple[str, dict]], messages: list[str | None] | None = None,
+    final_text: str | None = None,
 ) -> tuple[dict, list[dict]]:
     messages = messages or [None] * len(record)
     env = RobotEnv(use_hardware=False)
@@ -274,6 +275,12 @@ async def _replay(
             finally:
                 env.remove_movement_listener(on_movement)
 
+            # observe() is a read-only query the agent uses to plan — it never
+            # moves anything or changes deck state, so it's not a meaningful
+            # step to show in the viewer.
+            if name == "observe":
+                continue
+
             frames.append({
                 "step": i,
                 "tool": name,
@@ -282,6 +289,12 @@ async def _replay(
                 "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
                 "movements": movements,
                 "error": result.get("error"),
+                "snapshot": _snapshot(env, tip_rack_names),
+            })
+        if final_text:
+            frames.append({
+                "step": len(record), "tool": "done", "preview": "", "message": final_text,
+                "pipette_pos": None, "movements": [],
                 "snapshot": _snapshot(env, tip_rack_names),
             })
     finally:
@@ -300,15 +313,23 @@ def _load_template() -> str:
         return f.read()
 
 def render_html(goal: str, geometry: dict, frames: list[dict], title: str,
-                js: dict[str, str] | None = None) -> str:
+                js: dict[str, str] | None = None, live: bool = False,
+                frames_url: str = "") -> str:
     goal = " ".join(goal.split())
     three_js         = (js or {}).get("three.js", "")
     orbit_js         = (js or {}).get("OrbitControls.js", "")
+    max_step = len(frames) - 1
+    # Live mode: default to the newest known frame so a still-running
+    # experiment's tab opens already caught up, rather than at frame 0.
+    start_step = max_step if live else 0
     return (
         _load_template()
         .replace("__TITLE__", title)
         .replace("__GOAL__", goal)
-        .replace("__MAX_STEP__", str(len(frames) - 1))
+        .replace("__MAX_STEP__", str(max_step))
+        .replace("__START_STEP__", str(start_step))
+        .replace("__LIVE__", "true" if live else "false")
+        .replace("__FRAMES_URL__", frames_url)
         .replace("__GEOMETRY_JSON__", json.dumps(geometry))
         .replace("__FRAMES_JSON__", json.dumps(frames))
         .replace("__THREEJS__", three_js)
@@ -351,8 +372,9 @@ def main() -> None:
         data = json.load(f)
     record = [(name, call_args) for name, call_args in data["record"]]
     messages = data.get("messages")
+    final_text = data.get("final_text")
 
-    geometry, frames = asyncio.run(_replay(record, messages))
+    geometry, frames = asyncio.run(_replay(record, messages, final_text))
 
     title = os.path.basename(args.run_path)
     js    = _fetch_js()

@@ -35,7 +35,12 @@ import argparse
 import asyncio
 import json
 import os
+import socket
+import threading
+import webbrowser
 from datetime import datetime
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from agent import (
     SERIAL_DILUTION_SCRIPT, ToolCall,
@@ -43,7 +48,26 @@ from agent import (
     run_agent, run_scripted,
 )
 from star_sim import RobotEnv
-from pylabrobot.visualizer import Visualizer
+from visualize_run import _fetch_js, _replay, render_html
+
+
+def _serve_dir(directory: str) -> tuple[str, ThreadingHTTPServer]:
+    """Serve `directory` over a local HTTP server; return (base_url, server)."""
+    port = 8731
+    while True:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                break
+        port += 1
+
+    class _Handler(SimpleHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), partial(_Handler, directory=directory))
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{port}", server
 
 _DEFAULT_GOAL = (
     "Perform a 2-fold serial dilution of dye across 6 columns of destination plate. "
@@ -128,17 +152,6 @@ def _load_record(path: str) -> tuple[str, str, list[ToolCall]]:
     return data["goal"], data["final_text"], [(name, args) for name, args in data["record"]]
 
 
-async def _wait_for_browser(vis: Visualizer, timeout: float = 30.0) -> bool:
-    print("Waiting for the visualizer browser tab to connect...")
-    for _ in range(int(timeout / 0.1)):
-        if vis.has_connection():
-            print("Browser connected. Starting protocol.")
-            return True
-        await asyncio.sleep(0.1)
-    print("Warning: no browser connected within timeout; running anyway.")
-    return False
-
-
 async def main(
     use_hardware: bool,
     visualize: bool,
@@ -156,35 +169,73 @@ async def main(
     env = RobotEnv(use_hardware=use_hardware)
     await env.setup()
 
-    vis: Visualizer | None = None
+    live_server = None
+    write_frames = None
     if visualize:
         if use_hardware:
             raise SystemExit("--visualize is for simulation only; drop --hardware.")
-        vis = Visualizer(resource=env.lh.deck)
-        await vis.setup()
+        os.makedirs("runs", exist_ok=True)
+        frames_name = "_live.frames.json"
+        html_path = os.path.join("runs", "_live.viz.html")
+        frames_path = os.path.join("runs", frames_name)
+
+        async def write_frames(
+            record_so_far: list[ToolCall], messages_so_far: list[str | None],
+            final: str | None = None,
+        ) -> None:
+            _, frames = await _replay(record_so_far, messages_so_far, final)
+            with open(frames_path, "w") as f:
+                json.dump(frames, f)
+
+        # The HTML (with the bundled Three.js payload) is written once; only the
+        # small frames.json is rewritten per step, and the open tab polls that —
+        # no page reload, so the user can freely scrub through history without
+        # ever getting yanked back to the live edge.
+        geometry, initial_frames = await _replay([], [])
+        html = render_html(goal, geometry, initial_frames, "live run", _fetch_js(),
+                            live=True, frames_url=frames_name)
+        with open(html_path, "w") as f:
+            f.write(html)
+        await write_frames([], [])
+
+        serve_url, live_server = _serve_dir("runs")
+        webbrowser.open(f"{serve_url}/_live.viz.html")
+        print(f"\n[live]  Visualizer at {serve_url}/_live.viz.html")
+        if delay == 0.0:
+            delay = 0.5
+
+    async def on_step(record_so_far: list[ToolCall], messages_so_far: list[str | None]) -> None:
+        if write_frames:
+            await write_frames(record_so_far, messages_so_far)
+
+    live_hook = on_step if write_frames else None
 
     try:
-        if vis is not None:
-            await _wait_for_browser(vis)
-            if delay == 0.0:
-                delay = 0.5
-
         run_record: list[ToolCall] | None = None
 
         if replay is not None:
             goal, final_text, script = _load_record(replay)
             print(f"\n[replay]  Loaded {len(script)} steps from {replay}")
             print(f"\n[replay]  Goal: {goal}")
-            await run_scripted(env, script, step_delay=delay, confirm=confirm)
+            await run_scripted(env, script, step_delay=delay, confirm=confirm, on_step=live_hook)
             print("\n[replay]  Replay completed, see agent message:")
             print(f"\n[agent] {final_text}")
+            if write_frames:
+                await write_frames(script, [None] * len(script), final_text)
         elif scripted:
-            await run_scripted(env, SERIAL_DILUTION_SCRIPT, step_delay=delay, confirm=confirm)
+            await run_scripted(env, SERIAL_DILUTION_SCRIPT, step_delay=delay, confirm=confirm, on_step=live_hook)
             print("\n[script]  Script completed")
+            if write_frames:
+                await write_frames(SERIAL_DILUTION_SCRIPT, [None] * len(SERIAL_DILUTION_SCRIPT))
         else:
             print(f"\n[user]  Goal: {goal}")
             client = _build_client(provider, goal, model, base_url)
-            final_text, run_record, run_messages = await run_agent(client, env, step_delay=delay, confirm=confirm)
+
+            final_text, run_record, run_messages = await run_agent(
+                client, env, step_delay=delay, confirm=confirm, on_step=live_hook,
+            )
+            if write_frames:
+                await write_frames(run_record, run_messages, final_text)
             if record and run_record is not None:
                 path = _save_record(goal, final_text, run_record, run_messages)
                 print(f"\n[record]  Saved {len(run_record)} steps to {path}")
@@ -193,12 +244,12 @@ async def main(
         print("\n[user]  Final plate contents:")
         print(json.dumps(env.plate_map.to_dict(), indent=2))
 
-        if vis is not None:
-            input("\nVisualizer live at the URL above. Press Enter to close...")
+        if live_server is not None:
+            input("\n[live]  Run complete. The visualizer stays up — press Enter to stop it and exit...")
 
     finally:
-        if vis is not None:
-            await vis.stop()
+        if live_server is not None:
+            live_server.shutdown()
         await env.teardown()
 
 

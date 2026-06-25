@@ -14,7 +14,7 @@
       margin: 0;
       font-family: -apple-system, sans-serif;
       background: #f0f0f0;
-      font-size: 13px;
+      font-size: 16px;
       display: flex;
       flex-direction: row;
       overflow: hidden;
@@ -34,7 +34,7 @@
     }
 
     #left {
-      flex: 0 0 360px;
+      flex: 0 0 320px;
       height: 100vh;
       overflow-y: auto;
       border-right: 1px solid #ddd;
@@ -96,6 +96,7 @@
       font-size: 0.9em;
       color: #666;
       margin-bottom: 6px;
+      line-height: 1.75;
     }
 
     #controls {
@@ -219,14 +220,15 @@
         <button id="btn-play">&#9654; Play</button>
         <button id="btn-step-anim">&#9654;&#9614; Step</button>
         <button id="btn-fwd">&#9654;|</button>
+        <button id="btn-live" style="display:none">&#9679; Live</button>
       </div>
-      <input id="slider" type="range" min="0" max="__MAX_STEP__" value="0">
+      <input id="slider" type="range" min="0" max="__MAX_STEP__" value="__START_STEP__">
     </div>
     <div id="step-info">
       <div id="step-label"></div>
-      <div id="message"></div>
       <pre id="args"></pre>
       <div id="legend"></div>
+      <div id="message"></div>
     </div>
   </div>
   <div id="canvas-container"></div>
@@ -236,7 +238,9 @@
 
   <script>
     const GEOMETRY = __GEOMETRY_JSON__;
-    const FRAMES = __FRAMES_JSON__;
+    let FRAMES = __FRAMES_JSON__;
+    const LIVE = __LIVE__;
+    const FRAMES_URL = "__FRAMES_URL__";
   </script>
 
   <script>__THREEJS__</script>
@@ -580,18 +584,72 @@
 
     function stepBack() {
       isPlaying = false;
+      followLive = false;
       animState = null;
       if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
       if (currentFrameIdx > 0) goToFrame(currentFrameIdx - 1, false);
       updatePlayBtn();
+      updateLiveBtn();
     }
 
     function stepForward() {
       isPlaying = false;
+      followLive = false;
       animState = null;
       if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
       if (currentFrameIdx < FRAMES.length - 1) goToFrame(currentFrameIdx + 1, false);
       updatePlayBtn();
+      updateLiveBtn();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Live mode: poll a small frames.json for growth and merge it in without
+    // reloading the page (no flash, and manual scrubbing through history is
+    // never disturbed unless the user explicitly re-enables following).
+    // ---------------------------------------------------------------------------
+    let followLive = true;
+    let liveAdvancing = false;
+
+    function updateLiveBtn() {
+      const btn = document.getElementById('btn-live');
+      if (!LIVE) return;
+      btn.style.background = followLive ? '#cdebd6' : '#f0f0f0';
+      btn.textContent = followLive ? '● Live' : '○ Live';
+    }
+
+    function advanceToLatest() {
+      if (liveAdvancing) return;
+      liveAdvancing = true;
+      const step = () => {
+        if (!followLive || currentFrameIdx >= FRAMES.length - 1) { liveAdvancing = false; return; }
+        goToFrame(currentFrameIdx + 1, true, step);
+      };
+      step();
+    }
+
+    function goLive() {
+      followLive = true;
+      updateLiveBtn();
+      advanceToLatest();
+    }
+
+    async function pollFrames() {
+      try {
+        const res = await fetch(FRAMES_URL, { cache: 'no-store' });
+        const newFrames = await res.json();
+        if (newFrames.length === FRAMES.length) return;
+        FRAMES = newFrames;
+        document.getElementById('slider').max = FRAMES.length - 1;
+        if (followLive) advanceToLatest();
+      } catch (e) { /* server may be briefly unavailable between writes; ignore */ }
+    }
+
+    function startLivePolling() {
+      document.getElementById('btn-live').style.display = '';
+      document.getElementById('btn-play').style.display = 'none';
+      document.getElementById('btn-step-anim').style.display = 'none';
+      updateLiveBtn();
+      setInterval(pollFrames, 1500);
     }
 
     function updatePlayBtn() {
@@ -747,7 +805,7 @@
       buildTipSpots();
       buildPipette();
 
-      goToFrame(0, false);
+      goToFrame(__START_STEP__, false);
       renderLoop(0);
 
       // Event listeners
@@ -755,12 +813,15 @@
       document.getElementById('btn-back').addEventListener('click', stepBack);
       document.getElementById('btn-step-anim').addEventListener('click', playOneStep);
       document.getElementById('btn-fwd').addEventListener('click', stepForward);
+      document.getElementById('btn-live').addEventListener('click', goLive);
       document.getElementById('slider').addEventListener('input', e => {
         isPlaying = false;
+        followLive = false;
         animState = null;
         if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
         goToFrame(parseInt(e.target.value, 10), false);
         updatePlayBtn();
+        updateLiveBtn();
       });
 
       window.addEventListener('resize', () => {
@@ -768,6 +829,8 @@
         camera.updateProjectionMatrix();
         renderer.setSize(container.clientWidth, container.clientHeight);
       });
+
+      if (LIVE) startLivePolling();
     }
 
     init();
