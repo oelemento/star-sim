@@ -27,8 +27,8 @@ Examples:
     # Replay a previously recorded run:
     python run.py --replay runs/2026-06-11T12-00-00.json
 
-    # Step through each tool call for review:
-    python run.py --confirm
+    # Run without step-through confirmation:
+    python run.py --no-confirm
 """
 
 import argparse
@@ -277,8 +277,8 @@ if __name__ == "__main__":
                         help="model name override (each provider has a sensible default)")
     parser.add_argument("--base-url", type=str, default=None,
                         help="API base URL (required for openai-compat; overrides provider default)")
-    parser.add_argument("--confirm", action="store_true", default=False,
-                        help="pause before each tool call for step-through debugging")
+    parser.add_argument("--confirm", action=argparse.BooleanOptionalAction, default=True,
+                        help="pause before each tool call for review (default: on; use --no-confirm to run unattended)")
     parser.add_argument("--record", action="store_true",
                         help="write agent steps to runs/<timestamp>.json for later replay")
     parser.add_argument("--replay", type=str, default=None, metavar="PATH",
