@@ -3,44 +3,13 @@
 
 The agent receives a natural-language goal and issues liquid-handling commands
 autonomously. Set ANTHROPIC_API_KEY (default), or GROQ_API_KEY with --provider groq.
-
-Examples:
-    # Headless simulation with Claude (default):
-    python run.py
-
-    # Use Groq (openai/gpt-oss-120b by default):
-    # Local Ollama interop is also an available provider option
-    python run.py --provider groq
-
-    # Arbitrary OpenAI-compatible endpoint:
-    python run.py --provider openai-compat --model my-model --base-url http://host/v1
-
-    # Simulation with the live 3D browser visualizer:
-    python run.py --visualize
-
-    # Drive the physical Hamilton STAR over USB:
-    python run.py --hardware
-
-    # Save the agent's steps as a JSON replay file:
-    python run.py --record
-
-    # Replay a previously recorded run:
-    python run.py --replay runs/2026-06-11T12-00-00.json
-
-    # Run without step-through confirmation:
-    python run.py --no-confirm
 """
 
 import argparse
 import asyncio
 import json
 import os
-import socket
-import threading
 import webbrowser
-from datetime import datetime
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from agent import (
     SERIAL_DILUTION_SCRIPT, ToolCall,
@@ -48,26 +17,8 @@ from agent import (
     run_agent, run_scripted,
 )
 from star_sim import RobotEnv
-from visualize_run import LiveCapture, _fetch_js, _geometry, render_html
+from _archive.visualize_run import LiveCapture, _fetch_js, _geometry, render_html
 
-
-def _serve_dir(directory: str) -> tuple[str, ThreadingHTTPServer]:
-    """Serve `directory` over a local HTTP server; return (base_url, server)."""
-    port = 8731
-    while True:
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                break
-        port += 1
-
-    class _Handler(SimpleHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", port), partial(_Handler, directory=directory))
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{port}", server
 
 _DEFAULT_GOAL = (
     "Perform a 2-fold serial dilution of dye across 6 columns of destination plate. "
@@ -79,95 +30,50 @@ _DEFAULT_GOAL = (
 )
 
 
-def _resolve_goal(goal: str | None) -> str:
-    """Return the goal string. If goal looks like a file path, read it; else use as-is.
-    Falls back to _DEFAULT_GOAL when goal is None."""
-    if goal is None:
-        return _DEFAULT_GOAL
-    if os.path.exists(goal):
-        with open(goal) as f:
-            return f.read().strip()
-    return goal
-
-_PROVIDER_DEFAULTS: dict[str, dict] = {
-    "anthropic": {"model": "claude-opus-4-8",     "base_url": None},
-    "groq":      {"model": "openai/gpt-oss-120b", "base_url": "https://api.groq.com/openai/v1"},
-    "ollama":    {"model": "llama3.1:8b",          "base_url": "http://localhost:11434/v1"},
-}
-
-_PROVIDER_ENV_KEYS: dict[str, str] = {
-    "anthropic":    "ANTHROPIC_API_KEY",
-    "groq":         "GROQ_API_KEY",
-    "ollama":       "",           # Ollama doesn't need a key
-    "openai-compat": "OPENAI_API_KEY",
-}
+# def _save_record(
+#     goal: str, final_text: str, record: list[ToolCall], messages: list[str | None],
+# ) -> str:
+#     os.makedirs("runs", exist_ok=True)
+#     ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+#     path = f"runs/{ts}.json"
+#     with open(path, "w") as f:
+#         json.dump({"goal": goal, "final_text": final_text,
+#                    "record": [[name, args] for name, args in record],
+#                    "messages": messages}, f, indent=2)
+#     return path
 
 
-def _build_client(
-    provider: str,
-    goal: str,
-    model: str | None,
-    base_url: str | None,
-) -> AnthropicClient | OpenAICompatClient:
-    defaults = _PROVIDER_DEFAULTS.get(provider, {"model": None, "base_url": None})
-    resolved_model = model or defaults["model"]
-    resolved_url = base_url or defaults["base_url"]
-
-    if provider == "anthropic":
-        if not resolved_model:
-            resolved_model = "claude-opus-4-8"
-        return AnthropicClient(goal=goal, model=resolved_model)
-
-    # All other providers use the OpenAI-compatible client
-    env_key = _PROVIDER_ENV_KEYS.get(provider, "OPENAI_API_KEY")
-    api_key = os.environ.get(env_key, "none") if env_key else "ollama"
-    if not resolved_url:
-        raise SystemExit(f"--base-url is required for provider '{provider}'")
-    if not resolved_model:
-        raise SystemExit(f"--model is required for provider '{provider}'")
-    return OpenAICompatClient(
-        goal=goal,
-        model=resolved_model,
-        base_url=resolved_url,
-        api_key=api_key,
-    )
-
-
-def _save_record(
-    goal: str, final_text: str, record: list[ToolCall], messages: list[str | None],
-) -> str:
-    os.makedirs("runs", exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    path = f"runs/{ts}.json"
-    with open(path, "w") as f:
-        json.dump({"goal": goal, "final_text": final_text,
-                   "record": [[name, args] for name, args in record],
-                   "messages": messages}, f, indent=2)
-    return path
-
-
-def _load_record(path: str) -> tuple[str, str, list[ToolCall]]:
-    with open(path) as f:
-        data = json.load(f)
-    return data["goal"], data["final_text"], [(name, args) for name, args in data["record"]]
+# def _load_record(path: str) -> tuple[str, str, list[ToolCall]]:
+#     with open(path) as f:
+#         data = json.load(f)
+#     return data["goal"], data["final_text"], [(name, args) for name, args in data["record"]]
 
 
 async def main(
-    use_hardware: bool,
-    visualize: bool,
-    goal: str,
-    delay: float,
     scripted: bool,
     provider: str,
     model: str | None,
     base_url: str | None,
-    confirm: bool,
-    record: bool,
     replay: str | None,
 ) -> None:
-    goal = _resolve_goal(goal)
-    env = RobotEnv(use_hardware=use_hardware)
+    live = not scripted and not replay
+    if not live:
+        raise NotImplementedError
+    
+    env = RobotEnv(use_hardware=False)
     await env.setup()
+    
+    try:
+        geometry = _geometry(env)
+        live_capture = LiveCapture(env, geometry)
+        
+        async def on_step(name: str, args: dict, message: str | None, result: dict) -> None:
+            live_capture.record_step(name, args, message, result.get("error"))
+            
+        
+    finally:
+        await env.teardown()
+        return
 
     live_server = None
     live_capture: LiveCapture | None = None
@@ -262,14 +168,6 @@ if __name__ == "__main__":
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--hardware", action="store_true",
-                        help="drive the physical Hamilton STAR (default: simulation)")
-    parser.add_argument("--visualize", action="store_true",
-                        help="open the live browser visualizer (simulation only)")
-    parser.add_argument("--goal", type=str, default=None,
-                        help="experiment goal as a natural-language string or path to a .txt file")
-    parser.add_argument("--delay", type=float, default=0.0,
-                        help="seconds between operations (auto-set to 0.5 with --visualize)")
     parser.add_argument("--provider", type=str, default="anthropic",
                         choices=["anthropic", "groq", "ollama", "openai-compat"],
                         help="LLM provider (default: anthropic)")
@@ -277,10 +175,6 @@ if __name__ == "__main__":
                         help="model name override (each provider has a sensible default)")
     parser.add_argument("--base-url", type=str, default=None,
                         help="API base URL (required for openai-compat; overrides provider default)")
-    parser.add_argument("--confirm", action=argparse.BooleanOptionalAction, default=True,
-                        help="pause before each tool call for review (default: on; use --no-confirm to run unattended)")
-    parser.add_argument("--record", action="store_true",
-                        help="write agent steps to runs/<timestamp>.json for later replay")
     parser.add_argument("--replay", type=str, default=None, metavar="PATH",
                         help="load a recorded JSON file and run it as a scripted replay")
 
@@ -290,15 +184,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     asyncio.run(main(
-        use_hardware=args.hardware,
-        visualize=args.visualize,
-        goal=args.goal,
-        delay=args.delay,
         scripted=args.scripted,
         provider=args.provider,
         model=args.model,
         base_url=args.base_url,
-        confirm=args.confirm,
-        record=args.record,
         replay=args.replay,
     ))

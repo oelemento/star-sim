@@ -4,14 +4,14 @@ The agent receives a natural-language goal, then uses Claude's tool-use API to
 issue liquid-handling commands, observe deck state, and update the plate map
 until the experiment is complete.
 
-Also provides functions for running hardcoded scripts and agent loops with
-local models through Ollama.
+Also provides functions for running hardcoded scripts and agent loops with other models.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+import os
 from typing import Awaitable, Callable
 from dotenv import load_dotenv
 load_dotenv()
@@ -185,8 +185,7 @@ RULES
   2. Before each tool call, write a short description of what you are about to do
      and why.
   3. Call propose_prime first to declare all initial source plate contents. Use volumes that
-     are highly tractable to a human operator. In hardware deployment, propose_prime will
-     wait for operator confirmation.
+     are highly tractable to a human operator.
   4. Compound concentrations are tracked automatically via mass balance through every
      transfer and presented by observe().
   5. Cells stay where they are seeded. To move cells, first call mix_column to resuspend
@@ -334,14 +333,14 @@ class AnthropicClient:
         ]
         return AgentResponse(text=text, tool_uses=tool_uses)
 
-    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
-        self._messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(r)}
-            for tid, r in results
-        ]})
+    # def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+    #     self._messages.append({"role": "user", "content": [
+    #         {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(r)}
+    #         for tid, r in results
+    #     ]})
 
-    def inject_user_message(self, text: str) -> None:
-        self._messages.append({"role": "user", "content": text})
+    # def inject_user_message(self, text: str) -> None:
+    #     self._messages.append({"role": "user", "content": text})
 
 
 def _to_openai_tools(tools: list[dict]) -> list[dict]:
@@ -392,93 +391,201 @@ class OpenAICompatClient:
             tool_uses.append((tc.id, tc.function.name, args))
         return AgentResponse(text=text, tool_uses=tool_uses)
 
-    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
-        for tid, r in results:
-            self._messages.append({
-                "role": "tool",
-                "tool_call_id": tid,
-                "content": json.dumps(r),
-            })
+    # def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+    #     for tid, r in results:
+    #         self._messages.append({
+    #             "role": "tool",
+    #             "tool_call_id": tid,
+    #             "content": json.dumps(r),
+    #         })
 
-    def inject_user_message(self, text: str) -> None:
-        self._messages.append({"role": "user", "content": text})
+    # def inject_user_message(self, text: str) -> None:
+    #     self._messages.append({"role": "user", "content": text})
+        
+        
+_PROVIDER_DEFAULTS: dict[str, dict] = {
+    "anthropic": {"model": "claude-opus-4-8",     "base_url": None},
+    "groq":      {"model": "openai/gpt-oss-120b", "base_url": "https://api.groq.com/openai/v1"},
+    "ollama":    {"model": "llama3.1:8b",          "base_url": "http://localhost:11434/v1"},
+}
+
+_PROVIDER_ENV_KEYS: dict[str, str] = {
+    "anthropic":    "ANTHROPIC_API_KEY",
+    "groq":         "GROQ_API_KEY",
+    "ollama":       "",           # Ollama doesn't need a key
+    "openai-compat": "OPENAI_API_KEY",
+}
+
+
+def build_client(
+    provider: str,
+    goal: str,
+    model: str | None = None,
+    base_url: str | None = None,
+) -> AnthropicClient | OpenAICompatClient:
+    defaults = _PROVIDER_DEFAULTS.get(provider, {"model": None, "base_url": None})
+    resolved_model = model or defaults["model"]
+    resolved_url = base_url or defaults["base_url"]
+
+    if provider == "anthropic":
+        if not resolved_model:
+            resolved_model = "claude-opus-4-8"
+        return AnthropicClient(goal=goal, model=resolved_model)
+
+    # All other providers use the OpenAI-compatible client
+    env_key = _PROVIDER_ENV_KEYS.get(provider, "OPENAI_API_KEY")
+    api_key = os.environ.get(env_key, "none") if env_key else "ollama"
+    if not resolved_url:
+        raise SystemExit(f"--base-url is required for provider '{provider}'")
+    if not resolved_model:
+        raise SystemExit(f"--model is required for provider '{provider}'")
+    return OpenAICompatClient(
+        goal=goal,
+        model=resolved_model,
+        base_url=resolved_url,
+        api_key=api_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step-by-step session (used by the web server)
+# ---------------------------------------------------------------------------
+
+class AgentSession:
+    """One experiment session driven one turn at a time.
+
+    think() asks the LLM what to do next and stores the proposed tool uses.
+    act()   executes those tool uses against the robot and submits results back.
+
+    The caller controls when to advance — typically after showing the user
+    the proposed actions and receiving confirmation:
+
+        session = AgentSession(goal, env)
+        response = await session.think()
+        while not response.done:
+            # show response.text and response.tool_uses to user, wait for ok
+            await session.act(on_step=on_step)
+            response = await session.think()
+        # response.text is the final summary
+    """
+
+    def __init__(self, env: RobotEnv, client: AnthropicClient | OpenAICompatClient) -> None:
+        self._env = env
+        self._client = client
+        self._pending_tool_uses: list[tuple[str, str, dict]] = []  # (tool_use_id, name, args)
+        # self._last_text: str | None = None
+
+    async def think(self) -> AgentResponse:
+        """Run one LLM completion. Returns the agent's text and proposed tool uses."""
+        print(f"\n[user]  Prompting model ({self._client._model})...")
+        response = await self._client.complete()
+        if response.text:
+            print(f"\n[agent]  {response.text}")
+        for _, name, args in response.tool_uses:
+            args_str = json.dumps(args)
+            if len(args_str) > 120:
+                args_str = args_str[:117] + "..."
+            print(f"\n[tool]  {name}({args_str})")
+        # self._last_text = response.text
+        self._pending_tool_uses = response.tool_uses
+        return response
+
+    async def act(
+        self,
+        step_delay: float = 0.0,
+    ) -> None:
+        """Execute the tool uses proposed by the last think() and submit results."""
+        results: list[tuple[str, dict]] = []
+        for tid, name, args in self._pending_tool_uses:
+            result = await _dispatch(name, args, self._env, step_delay)
+            summary = json.dumps(result)
+            if len(summary) > 300:
+                summary = summary[:297] + "..."
+            print(f"  → {summary}\n")
+            results.append((tid, result))
+        self._client.submit_tool_results(results)
+        self._pending_tool_uses = []
+
+    # def inject_message(self, text: str) -> None:
+    #     """Inject a user message into the conversation (e.g. mid-run feedback)."""
+    #     self._client.inject_user_message(text)
 
 
 # ---------------------------------------------------------------------------
 # Unified agent loop
 # ---------------------------------------------------------------------------
 
-async def run_agent(
-    client: AnthropicClient | OpenAICompatClient,
-    env: RobotEnv,
-    step_delay: float = 0.0,
-    confirm: bool = False,
-    on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
-) -> tuple[str, list[ToolCall], list[str | None]]:
-    """Drive an agent client to execute a goal on the robot.
+# async def run_agent(
+#     client: AnthropicClient | OpenAICompatClient,
+#     env: RobotEnv,
+#     step_delay: float = 0.0,
+#     confirm: bool = False,
+#     on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
+# ) -> tuple[str, list[ToolCall], list[str | None]]:
+#     """Drive an agent client to execute a goal on the robot.
 
-    Works with AnthropicClient or any OpenAICompatClient (Groq, Ollama, etc.).
-    Returns (final_text, record, messages) where record is the list of executed
-    tool calls and messages[i] is the agent's explanatory text (if any) from the
-    turn that produced record[i] — the same text repeats across every tool call
-    issued in one turn, since one explanation can cover a batch of actions.
+#     Works with AnthropicClient or any OpenAICompatClient (Groq, Ollama, etc.).
+#     Returns (final_text, record, messages) where record is the list of executed
+#     tool calls and messages[i] is the agent's explanatory text (if any) from the
+#     turn that produced record[i] — the same text repeats across every tool call
+#     issued in one turn, since one explanation can cover a batch of actions.
 
-    on_step, if given, is awaited after every executed tool call with
-    (name, args, message, result) for that single call — e.g. for a live
-    visualizer to fold into its own accumulated state, without re-deriving
-    anything from the full history.
-    """
-    record: list[ToolCall] = []
-    messages: list[str | None] = []
+#     on_step, if given, is awaited after every executed tool call with
+#     (name, args, message, result) for that single call — e.g. for a live
+#     visualizer to fold into its own accumulated state, without re-deriving
+#     anything from the full history.
+#     """
+#     record: list[ToolCall] = []
+#     messages: list[str | None] = []
 
-    while True:
-        print(f"\n[user]  Prompting model ({client._model})...")
-        response = await client.complete()
+#     while True:
+#         print(f"\n[user]  Prompting model ({client._model})...")
+#         response = await client.complete()
 
-        if response.text:
-            print(f"\n[agent]  {response.text}")
-        if not confirm:
-            for _, name, args in response.tool_uses:
-                args_str = json.dumps(args)
-                if len(args_str) > 120:
-                    args_str = args_str[:117] + "..."
-                print(f"\n[tool]  {name}({args_str})")
+#         if response.text:
+#             print(f"\n[agent]  {response.text}")
+#         if not confirm:
+#             for _, name, args in response.tool_uses:
+#                 args_str = json.dumps(args)
+#                 if len(args_str) > 120:
+#                     args_str = args_str[:117] + "..."
+#                 print(f"\n[tool]  {name}({args_str})")
 
-        if response.done:
-            return response.text or "", record, messages
+#         if response.done:
+#             return response.text or "", record, messages
 
-        tool_results: list[tuple[str, dict]] = []
-        injection: UserInjection | None = None
+#         tool_results: list[tuple[str, dict]] = []
+#         injection: UserInjection | None = None
 
-        for tid, name, args in response.tool_uses:
-            if confirm and injection is None:
-                try:
-                    decision = _confirm_agent(name, args)
-                except UserInjection as exc:
-                    injection = exc
-                    decision = None
-                if decision is None:
-                    print(f"  [skipped] {name}")
-                    tool_results.append((tid, {"skipped": True}))
-                    continue
-                name, args = decision
+#         for tid, name, args in response.tool_uses:
+#             if confirm and injection is None:
+#                 try:
+#                     decision = _confirm_agent(name, args)
+#                 except UserInjection as exc:
+#                     injection = exc
+#                     decision = None
+#                 if decision is None:
+#                     print(f"  [skipped] {name}")
+#                     tool_results.append((tid, {"skipped": True}))
+#                     continue
+#                 name, args = decision
 
-            result = await _dispatch(name, args, env, step_delay, silent=confirm)
-            record.append((name, args))
-            messages.append(response.text)
-            summary = json.dumps(result)
-            if len(summary) > 300:
-                summary = summary[:297] + "..."
-            print(f"  → {summary}\n")
-            tool_results.append((tid, result))
+#             result = await _dispatch(name, args, env, step_delay, silent=confirm)
+#             record.append((name, args))
+#             messages.append(response.text)
+#             summary = json.dumps(result)
+#             if len(summary) > 300:
+#                 summary = summary[:297] + "..."
+#             print(f"  → {summary}\n")
+#             tool_results.append((tid, result))
 
-            if on_step:
-                await on_step(name, args, response.text, result)
+#             if on_step:
+#                 await on_step(name, args, response.text, result)
 
-        client.submit_tool_results(tool_results)
+#         client.submit_tool_results(tool_results)
 
-        if injection is not None:
-            client.inject_user_message(injection.text)
+#         if injection is not None:
+#             client.inject_user_message(injection.text)
         
 
 # ---------------------------------------------------------------------------

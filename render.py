@@ -1,32 +1,17 @@
-#!/usr/bin/env python3
-"""Render a recorded run as a 3D step-through deck visualization.
-
-Replays a runs/<timestamp>.json file, snapshotting compound/concentration and
-tip occupancy after each step, and writes a self-contained HTML file with a
-Three.js 3D scene.  A Play/Pause button animates the pipette arm across the
-deck step by step; Back resets to the previous frame instantly.
-
-Usage:
-    python visualize_run.py runs/2026-06-12T16-43-33.json
-    python visualize_run.py runs/2026-06-12T16-43-33.json --open
-"""
-
-import argparse
-import asyncio
 import json
 import os
-import urllib.request
-import webbrowser
 
-from agent import _dispatch, _preview
-from star_sim import RobotEnv
+import urllib
+
+from star_sim.env import RobotEnv
 from pylabrobot.resources import Resource
+
 
 _ROWS = "ABCDEFGH"
 _COLS = range(1, 13)
 
 
-def _geometry(env: RobotEnv) -> dict:
+def geometry(env: RobotEnv) -> dict:
     """Walk the deck tree and collect geometry.  Every resource gets x/y/z/w/h/d."""
     boxes: list[dict] = []
     wells: list[dict] = []
@@ -195,7 +180,7 @@ def _tip_col_center(rack_name: str, col: int, geometry: dict) -> dict | None:
         "y": sum(s["y"] + s["h"] / 2 for s in ps) / len(ps),
         "plate": None,
     }
-
+    
 
 # Whether tips become visible (True), get discarded (False), or are unaffected
 # (omitted) on the pipette after each kind of recorded movement.
@@ -212,120 +197,21 @@ def _movement_target(kind: str, info: dict, geometry: dict) -> dict | None:
     return None
 
 
-def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
-    snap: dict = {}
-    for plate_name in ("source_plate", "dest_plate"):
-        plate = getattr(env.layout, plate_name)
-        plate_wells: dict = {}
-        for row in _ROWS:
-            for col in _COLS:
-                well_id = f"{row}{col}"
-                volume = plate.get_item(well_id).tracker.get_used_volume()
-                contents = env.plate_map.get_well(plate_name, well_id)
-                entry = {"volume": round(volume, 1)}
-                if contents and contents.compounds:
-                    entry["compounds"] = [
-                        {"name": c.name, "conc": round(c.concentration_um, 3)}
-                        for c in contents.compounds
-                    ]
-                if contents and contents.cells:
-                    entry["cells"] = contents.cells
-                plate_wells[well_id] = entry
-        snap[plate_name] = plate_wells
-
-    tip_racks: dict = {}
-    for rack_name in tip_rack_names:
-        rack = env.layout.deck.get_resource(rack_name)
-        tip_racks[rack_name] = {
-            spot.name[len(f"{rack_name}_tipspot_"):]: spot.tracker.has_tip
-            for spot in rack.children
-        }
-    snap["tip_racks"] = tip_racks
-    return snap
-
-
-async def _replay_one(
-    env: RobotEnv, geometry: dict, tip_rack_names: list[str],
-    step_idx: int, name: str, args: dict, message: str | None,
-) -> dict | None:
-    """Execute one already-recorded tool call against env and build its frame.
-
-    Returns None for tool calls that shouldn't appear as a step (currently just
-    observe() — a read-only query that never moves anything or changes state).
-    """
-    movements: list[dict] = []
-
-    def on_movement(kind: str, info: dict) -> None:
-        movements.append({
-            "kind": kind,
-            "pipette_pos": _movement_target(kind, info, geometry),
-            "show_tips": _SHOW_TIPS_AFTER.get(kind),
-            "snapshot": _snapshot(env, tip_rack_names),
-        })
-
-    env.add_movement_listener(on_movement)
-    try:
-        result = await _dispatch(name, args, env, step_delay=0.0, silent=True)
-    finally:
-        env.remove_movement_listener(on_movement)
-
-    if name == "observe":
-        return None
-
-    return {
-        "step": step_idx,
-        "tool": name,
-        "preview": _preview(name, args),
-        "message": message,
-        "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
-        "movements": movements,
-        "error": result.get("error"),
-        "snapshot": _snapshot(env, tip_rack_names),
-    }
-
-
-def _initial_frame(geometry: dict, env: RobotEnv, tip_rack_names: list[str]) -> dict:
-    return {"step": -1, "tool": "initial", "preview": "", "message": None,
-            "pipette_pos": geometry["home_pos"], "movements": [],
-            "snapshot": _snapshot(env, tip_rack_names)}
-
-
-def _done_frame(record_len: int, env: RobotEnv, tip_rack_names: list[str], final_text: str) -> dict:
-    return {"step": record_len, "tool": "done", "preview": "", "message": final_text,
-            "pipette_pos": None, "movements": [],
-            "snapshot": _snapshot(env, tip_rack_names)}
-
-
-async def _replay(
-    record: list[tuple[str, dict]], messages: list[str | None] | None = None,
-    final_text: str | None = None,
-) -> tuple[dict, list[dict]]:
-    messages = messages or [None] * len(record)
-    env = RobotEnv(use_hardware=False)
-    await env.setup()
-    try:
-        geometry = _geometry(env)
-        tip_rack_names = geometry["tip_rack_names"]
-        frames = [_initial_frame(geometry, env, tip_rack_names)]
-
-        for i, (name, args) in enumerate(record):
-            frame = await _replay_one(
-                env, geometry, tip_rack_names, i, name, args,
-                messages[i] if i < len(messages) else None,
-            )
-            if frame is not None:
-                frames.append(frame)
-        if final_text:
-            frames.append(_done_frame(len(record), env, tip_rack_names, final_text))
-    finally:
-        await env.teardown()
-    return geometry, frames
+def _initial_frame(geometry: dict) -> dict:
+    return {"step": -1, 
+            "pipette_pos": geometry["home_pos"], 
+            "movements": []}
+    
+    
+def _done_frame(record_len: int) -> dict:
+    return {"step": record_len,
+            "pipette_pos": None,
+            "movements": []}
 
 
 class LiveCapture:
-    """Builds the same frame structure as _replay(), but by listening to a live
-    RobotEnv's own movement events as they really happen — no second env, no
-    re-dispatching, no duplicate ChatterboxBackend chatter. The state needed to
+    """Builds the frame structure by listening to a live
+    RobotEnv's own movement events as they really happen — The state needed to
     render each step (positions, snapshots) was already computed once by the
     real dispatch; this just packages it instead of recomputing it.
 
@@ -338,7 +224,7 @@ class LiveCapture:
         self.env = env
         self.geometry = geometry
         self.tip_rack_names = geometry["tip_rack_names"]
-        self.frames: list[dict] = [_initial_frame(geometry, env, self.tip_rack_names)]
+        self.frames: list[dict] = [_initial_frame(geometry)]
         self._pending: list[dict] = []
         self._step_idx = 0
         env.add_movement_listener(self._on_movement)
@@ -348,7 +234,7 @@ class LiveCapture:
             "kind": kind,
             "pipette_pos": _movement_target(kind, info, self.geometry),
             "show_tips": _SHOW_TIPS_AFTER.get(kind),
-            "snapshot": _snapshot(self.env, self.tip_rack_names),
+            # "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
     def record_step(self, name: str, args: dict, message: str | None, error: str | None) -> None:
@@ -358,50 +244,40 @@ class LiveCapture:
             return
         self.frames.append({
             "step": step_idx,
-            "tool": name,
-            "preview": _preview(name, args),
-            "message": message,
+            # "tool": name,
+            # "preview": _preview(name, args),
+            # "message": message,
             "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
             "movements": movements,
             "error": error,
-            "snapshot": _snapshot(self.env, self.tip_rack_names),
+            # "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
     def finish(self, final_text: str | None) -> None:
         if final_text:
-            self.frames.append(_done_frame(self._step_idx, self.env, self.tip_rack_names, final_text))
+            self.frames.append(_done_frame(self._step_idx))
 
     def close(self) -> None:
         self.env.remove_movement_listener(self._on_movement)
 
-    async def teardown(self) -> None:
-        await self.env.teardown()
+    # async def teardown(self) -> None:
+    #     await self.env.teardown()
 
 
-# ---------------------------------------------------------------------------
-# HTML template — uses __MARKER__ substitution (no Python .format() escaping)
-# ---------------------------------------------------------------------------
-
-_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "viz_template.html")
-
-def _load_template() -> str:
-    with open(_TEMPLATE_PATH) as f:
-        return f.read()
-
-def render_html(goal: str, geometry: dict, frames: list[dict], title: str,
-                js: dict[str, str] | None = None, live: bool = False,
+def render_html(geometry: dict, frames: list[dict], title: str,
+                live: bool = False,
                 frames_url: str = "") -> str:
-    goal = " ".join(goal.split())
+    js = _fetch_js()
     three_js         = (js or {}).get("three.js", "")
     orbit_js         = (js or {}).get("OrbitControls.js", "")
     max_step = len(frames) - 1
     # Live mode: default to the newest known frame so a still-running
     # experiment's tab opens already caught up, rather than at frame 0.
     start_step = max_step if live else 0
+    template = open(os.path.join(os.path.dirname(__file__), "app_template.html")).read()
     return (
-        _load_template()
+        template
         .replace("__TITLE__", title)
-        .replace("__GOAL__", goal)
         .replace("__MAX_STEP__", str(max_step))
         .replace("__START_STEP__", str(start_step))
         .replace("__LIVE__", "true" if live else "false")
@@ -411,8 +287,8 @@ def render_html(goal: str, geometry: dict, frames: list[dict], title: str,
         .replace("__THREEJS__", three_js)
         .replace("__ORBITCONTROLS__", orbit_js)
     )
-
-
+    
+    
 _CACHE_DIR = os.path.join(os.path.dirname(__file__), ".viz_cache")
 _THREE_URLS = {
     "three.js":         "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js",
@@ -436,33 +312,3 @@ def _fetch_js() -> dict[str, str]:
                 f.write(content)
             result[name] = content
     return result
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_path", help="path to runs/<timestamp>.json")
-    parser.add_argument("--open", action="store_true", help="open the HTML file in a browser when done")
-    args = parser.parse_args()
-
-    with open(args.run_path) as f:
-        data = json.load(f)
-    record = [(name, call_args) for name, call_args in data["record"]]
-    messages = data.get("messages")
-    final_text = data.get("final_text")
-
-    geometry, frames = asyncio.run(_replay(record, messages, final_text))
-
-    title = os.path.basename(args.run_path)
-    js    = _fetch_js()
-    html  = render_html(data.get("goal", "UNKNOWN GOAL"), geometry, frames, title, js)
-    out_path = os.path.splitext(args.run_path)[0] + ".viz.html"
-    with open(out_path, "w") as f:
-        f.write(html)
-
-    print(f"Wrote {out_path}")
-    if args.open:
-        webbrowser.open(f"file://{os.path.abspath(out_path)}")
-
-
-if __name__ == "__main__":
-    main()

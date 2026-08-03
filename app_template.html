@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>__TITLE__</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+
+<body>
+
+  <!-- ── LEFT PANEL ─────────────────────────────────────────── -->
+  <div id="left">
+
+    <div id="left-header">
+      <h1>Hamilton STAR - Digital Twin</h1>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span id="mode-badge">Simulation</span>
+        <button id="btn-quit" title="Shut down server">&#x2715;</button>
+      </div>
+    </div>
+
+    <div id="conversation">
+      <div id="empty-state">
+        Enter an experiment prompt below.<br><br>
+        The agent will explain each step here<br>as it designs and runs the experiment.
+      </div>
+    </div>
+
+    <div id="status-line"></div>
+
+    <div id="step-info">
+      <div id="step-label"></div>
+      <pre id="args"></pre>
+      <div id="message"></div>
+    </div>
+
+    <div id="playback">
+      <div id="controls">
+        <button id="btn-back">&#9664;</button>
+        <button id="btn-play">&#9654; Play</button>
+        <button id="btn-step-anim">&#9654;&#9614; Step</button>
+        <button id="btn-fwd">&#9654;|</button>
+        <button id="btn-live">&#9679; Live</button>
+      </div>
+      <input id="slider" type="range" min="0" max="__MAX_STEP__" value="__START_STEP__">
+    </div>
+
+    <div id="prompt-area">
+      <textarea id="prompt-input"
+        placeholder="Describe the experiment in plain language, e.g. ' Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates each.'"></textarea>
+      <div id="prompt-actions">
+        <button id="btn-run">&#9654; Run simulation</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── CENTER: 3D CANVAS ──────────────────────────────────── -->
+  <div id="canvas-container"></div>
+
+  <!-- ── RIGHT PANEL ────────────────────────────────────────── -->
+  <div id="tree-col">
+    <div id="tree-panel-header">Deck</div>
+    <div id="tree-panel"></div>
+    <div id="legend-section">
+      <div id="legend-header">Legend</div>
+      <div id="legend"></div>
+    </div>
+  </div>
+
+  <script>
+    const GEOMETRY = __GEOMETRY_JSON__;
+    let FRAMES = __FRAMES_JSON__;
+    const START_STEP = __START_STEP__;
+  </script>
+
+  <script>__THREEJS__</script>
+  <script>__ORBITCONTROLS__</script>
+  <script src="/static/app.js"></script>
+
+</body>
+
+</html>
