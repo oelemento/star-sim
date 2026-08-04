@@ -1056,6 +1056,14 @@ async function submitConfirm() {
   disableActiveProposals();
   phase = 'busy';
   render();
+  // Scrubbing back through history (stepBack/stepForward/slider) drops out of
+  // live mode so it isn't yanked out from under the user mid-scrub — but
+  // running the next action means there's new live progress to show, so jump
+  // back in: catch up (animated) through anything already loaded, then keep
+  // following as new frames arrive.
+  followLive = true;
+  updateLiveBtn();
+  advanceToLatest();
   const res = await fetch('/confirm', { method: 'POST' });
   if (!res.ok) {
     const data = await res.json();

@@ -801,11 +801,15 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                         # set volumes
                         for row in "ABCDEFGH":
                             plate_obj.get_item(f"{row}{r['col']}").tracker.set_volume(r["volume_ul"])
-                        # set compounds
-                        conc = r.get("concentration_um", 0.0)
+                        # set compounds — identity is recorded whenever a name was given,
+                        # independent of concentration: DMSO/media are routinely primed with
+                        # no concentration_um at all (the tool schema says as much), and that
+                        # used to get silently treated as "no compound" and discarded, making
+                        # vehicle-control and media-only wells indistinguishable from a truly
+                        # undeclared buffer.
                         compounds = (
-                            [Compound(name=r["compound"], concentration_um=conc)]
-                            if "compound" in r and conc > 0 else []
+                            [Compound(name=r["compound"], concentration_um=r.get("concentration_um", 0.0))]
+                            if "compound" in r else []
                         )
                         # set cells
                         env.plate_map.set_column(

@@ -1,15 +1,14 @@
 # star-sim — Hamilton STAR digital twin
 
 A simulated Hamilton STARlet built on [PyLabRobot](https://docs.pylabrobot.org).
-The same protocol code runs against a **simulated** robot (ChatterBox backend +
-browser visualizer) or the **physical** Hamilton STAR, selected by a single flag.
+The same protocol can run against a **simulated** robot (ChatterBox backend +
+browser visualizer) or the **physical** Hamilton STAR.
 Built as a safe testbed for AI-directed liquid-handling experiments.
 
 ## Why
 
-- Develop and validate protocols with **no robot and no risk** — overfills,
-  missing tips, and empty-well aspirations surface in software, not on hardware.
-- Volume and tip state are tracked, so the twin reflects real deck state.
+- Develop and validate protocols with **no robot and no risk** — overfills, missing tips, and empty-well aspirations surface in software, not on hardware.
+  - For example, final volumes and concentrations are automatically calculated (not guess-timated by an LLM), enabling the validation of procedural results.
 - Natural language interface for developing a sequence of experimental operations.
 - Deploys directly to simulation backend or physical Hamilton at the press of a button.
 
@@ -38,12 +37,14 @@ star_sim/
 protocols/
   serial_dilution.py   demo: 8-channel 2-fold serial dilution (unused)
   primitives.py        protocol primitives used by the agent such as single-use column transfer or serial transfer
-agent.py      Claude-based, local Ollama-based, and scripted runs
-app.py        Uvicorn app, exposes browser-based interface
+agent.py      Wrapper for Anthropic and OpenAI-like APIs
+app.py        Uvicorn app, provides browser-based interface
 ```
 
 ## TODO
 - Branching experimental designs
-- Dynamic and easily configurable deck layouts
+- Dynamic and easily configurable deck layouts (potential interop with existing Hamilton software tools?)
 - Single-channel pipetting
 - Full documentation
+- Segmented message+tool behavior for free but weaker models such as gpt-oss (by default, only produces either a message or a tool call, not both at the same time)
+- Post-experiment redirection ("wait, you forgot this last step")
