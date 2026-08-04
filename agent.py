@@ -333,11 +333,11 @@ class AnthropicClient:
         ]
         return AgentResponse(text=text, tool_uses=tool_uses)
 
-    # def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
-    #     self._messages.append({"role": "user", "content": [
-    #         {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(r)}
-    #         for tid, r in results
-    #     ]})
+    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+        self._messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "content": json.dumps(r)}
+            for tid, r in results
+        ]})
 
     # def inject_user_message(self, text: str) -> None:
     #     self._messages.append({"role": "user", "content": text})
@@ -391,13 +391,13 @@ class OpenAICompatClient:
             tool_uses.append((tc.id, tc.function.name, args))
         return AgentResponse(text=text, tool_uses=tool_uses)
 
-    # def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
-    #     for tid, r in results:
-    #         self._messages.append({
-    #             "role": "tool",
-    #             "tool_call_id": tid,
-    #             "content": json.dumps(r),
-    #         })
+    def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
+        for tid, r in results:
+            self._messages.append({
+                "role": "tool",
+                "tool_call_id": tid,
+                "content": json.dumps(r),
+            })
 
     # def inject_user_message(self, text: str) -> None:
     #     self._messages.append({"role": "user", "content": text})
@@ -493,8 +493,13 @@ class AgentSession:
     async def act(
         self,
         step_delay: float = 0.0,
+        on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
     ) -> None:
-        """Execute the tool uses proposed by the last think() and submit results."""
+        """Execute the tool uses proposed by the last think() and submit results.
+
+        on_step, if given, is awaited after every executed tool call with
+        (name, args, message, result) — same contract documented on the class.
+        """
         results: list[tuple[str, dict]] = []
         for tid, name, args in self._pending_tool_uses:
             result = await _dispatch(name, args, self._env, step_delay)
@@ -503,6 +508,8 @@ class AgentSession:
                 summary = summary[:297] + "..."
             print(f"  → {summary}\n")
             results.append((tid, result))
+            if on_step:
+                await on_step(name, args, None, result)
         self._client.submit_tool_results(results)
         self._pending_tool_uses = []
 
@@ -598,11 +605,11 @@ class UserInjection(Exception):
         self.text = text
 
 
-def _preview(name: str, args: dict) -> str:
+def preview_tool(name: str, args: dict) -> str:
     """Return a human-readable one-or-few-line description of a tool call."""
     match name:
         case "propose_prime":
-            lines = ["propose_prime:"]
+            lines = []
             for r in args.get("reagents", []):
                 plate = r.get("plate", "source_plate")
                 col = r.get("col", "?")
@@ -616,13 +623,13 @@ def _preview(name: str, args: dict) -> str:
                     parts.append(f"{r['cells']}{density}")
                 if not parts:
                     parts.append("media/buffer")
-                lines.append(f"  {plate} col {col}: {', '.join(parts)}  ({vol} µL/well)")
+                lines.append(f"{plate} col {col}: {', '.join(parts)}  ({vol} µL/well)")
             return "\n".join(lines)
 
         case "column_transfer":
             tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
             return (
-                f"column_transfer: {args['src_plate']} col {args['src_col']} → "
+                f"{args['src_plate']} col {args['src_col']} → "
                 f"{args['dst_plate']} col {args['dst_col']}  ({args['volume']} µL){tc}"
             )
 
@@ -630,29 +637,27 @@ def _preview(name: str, args: dict) -> str:
             cols = args.get("dst_cols", [])
             tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
             return (
-                f"multi_dispense: {args['src_plate']} col {args['src_col']} → "
+                f"{args['src_plate']} col {args['src_col']} → "
                 f"{args['dst_plate']} cols {cols}  ({args['volume']} µL each){tc}"
             )
 
         case "serial_transfer":
             cols = " → ".join(str(c) for c in range(args["start_col"], args["end_col"] + 1))
             tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
-            return (
-                f"serial_transfer: {args['plate']} cols {cols}  ({args['volume']} µL steps){tc}"
-            )
+            return f"{args['plate']} cols {cols}  ({args['volume']} µL steps){tc}"
 
         case "mix_column":
             reps = args.get("repetitions", 3)
-            return f"mix_column: {args['plate']} col {args['col']}  ({args['volume']} µL × {reps} reps)"
+            return f"{args['plate']} col {args['col']}  ({args['volume']} µL × {reps} reps)"
 
         case "observe":
-            return "observe: read current deck state"
+            return "read current deck state"
 
         case _:
             raw = json.dumps(args)
             if len(raw) > 200:
                 raw = raw[:197] + "..."
-            return f"{name}({raw})"
+            return raw
 
 
 def _confirm_scripted(name: str, args: dict) -> tuple[str, dict] | None:
@@ -662,7 +667,7 @@ def _confirm_scripted(name: str, args: dict) -> tuple[str, dict] | None:
     Returns (name, args) to execute (possibly replaced), None to skip.
     Raises KeyboardInterrupt on quit.
     """
-    print(f"\n[next]  {_preview(name, args)}")
+    print(f"\n[next]  {name}: {preview_tool(name, args)}")
     try:
         ans = input("  Enter=run  s=skip  r=replace  q=quit: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -686,7 +691,7 @@ def _confirm_agent(name: str, args: dict) -> tuple[str, dict] | None:
     Raises UserInjection when the user wants to redirect the LLM.
     Raises KeyboardInterrupt on quit.
     """
-    print(f"\n[next]  {_preview(name, args)}")
+    print(f"\n[next]  {name}: {preview_tool(name, args)}")
     try:
         ans = input("  Enter=run  s=skip  r=replace  m=message  q=quit: ").strip().lower()
     except (EOFError, KeyboardInterrupt):

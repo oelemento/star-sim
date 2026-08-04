@@ -39,15 +39,31 @@ const DEFAULT_BOX_OPACITY = 1;
 const HOVER_DIM_OPACITY = 0.4;
 
 // ── Color helpers ──────────────────────────────────────────────────────
+// A hash-derived hue (even a well-mixed one) only spreads any *given pair*
+// of names apart on average — with just 2-6 compounds actually in play at
+// once, it's common for two of them to land within a few degrees of each
+// other by pure chance, which is exactly what looked wrong on screen.
+// Instead, assign hues in first-seen order stepped by the golden angle
+// (~137.5°) around the wheel: each new compound lands as far as possible
+// from every hue already handed out, so concurrently-visible compounds stay
+// visually distinct regardless of how many there are or what they're named.
+const _GOLDEN_ANGLE = 137.50776;
+const _compoundHues = new Map();
+function hueForName(name) {
+  if (!_compoundHues.has(name)) {
+    _compoundHues.set(name, (_compoundHues.size * _GOLDEN_ANGLE) % 360);
+  }
+  return _compoundHues.get(name);
+}
+
 function colorForWell(entry) {
   const c = new THREE.Color();
   if (!entry || entry.volume <= 0) { c.set(0xffffff); return c; }
   if (entry.compounds && entry.compounds.length) {
     const comp = entry.compounds[0];
-    let hash = 0;
-    for (const ch of comp.name) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
+    const hue = hueForName(comp.name);
     const pct = Math.min(comp.conc / 200, 1);
-    c.setHSL(hash / 360, 0.72, 0.8 - pct * 0.5);
+    c.setHSL(hue / 360, 0.72, 0.8 - pct * 0.5);
     return c;
   }
   if (entry.cells) { c.set(0xa8d4ff); return c; }
@@ -211,7 +227,11 @@ function snapPipette(pos) {
 }
 
 // ── Frame navigation ───────────────────────────────────────────────────
-let currentFrameIdx = 0;
+// -1 means "nothing shown yet" — distinct from 0, which is a real first
+// frame. FRAMES starts empty in live mode, so treating 0 as the initial
+// value made advanceToLatest()'s "already caught up" check true the moment
+// a single frame arrived, silently skipping the render of frame 0.
+let currentFrameIdx = -1;
 let isPlaying = false;
 let playTimeout = null;
 
@@ -358,6 +378,17 @@ function treeNodeHTML(box, frame, depth) {
   return html;
 }
 
+// A synthetic "nothing has run yet" snapshot — every tip present, no plate
+// contents — so the tree/legend panels have something to show before the
+// first real frame arrives (they normally only ever see frame.snapshot).
+function initialSnapshot() {
+  const tip_racks = {};
+  for (const t of GEOMETRY.tip_spots) {
+    (tip_racks[t.rack] = tip_racks[t.rack] || {})[t.id] = true;
+  }
+  return { tip_racks };
+}
+
 function renderTree(frame) {
   const roots = TREE_CHILDREN[ROOT_KEY] || [];
   const panel = document.getElementById('tree-panel');
@@ -403,9 +434,8 @@ function renderLegend(frame) {
 
   const chips = [];
   for (const name of names) {
-    let hash = 0;
-    for (const ch of name) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
-    chips.push(`<span><span class="swatch" style="background:hsl(${hash},72%,55%)"></span>${name}</span>`);
+    const hue = hueForName(name);
+    chips.push(`<span><span class="swatch" style="background:hsl(${hue},72%,55%)"></span>${name}</span>`);
   }
   chips.push(`<span><span class="swatch" style="background:#3a6a9a"></span>cells</span>`);
   chips.push(`<span><span class="swatch" style="background:#444"></span>buffer</span>`);
@@ -415,7 +445,10 @@ function renderLegend(frame) {
 
 function updateUI(frame) {
   if (!frame) return;
-  const total = FRAMES.length - 2;
+  // FRAMES holds only real steps (no leading/trailing bookend frames in this
+  // app's live/streamed data model), so the highest valid step index is
+  // simply the last position in the array.
+  const total = FRAMES.length - 1;
   document.getElementById('step-label').innerHTML =
     frame.step >= 0
       ? `Step ${frame.step} / ${total}: <b>${frame.tool}</b>` +
@@ -479,7 +512,13 @@ function init() {
   buildTipSpots();
   buildPipette();
 
-  if (FRAMES.length > 0) goToFrame(START_STEP, false);
+  if (FRAMES.length > 0) {
+    goToFrame(START_STEP, false);
+  } else {
+    const frame = { snapshot: initialSnapshot() };
+    renderTree(frame);
+    renderLegend(frame);
+  }
   renderLoop(0);
 
   document.getElementById('btn-play').addEventListener('click', togglePlay);
@@ -495,11 +534,38 @@ function init() {
   });
   document.getElementById('btn-run').addEventListener('click', submitPrompt);
   document.getElementById('btn-quit').addEventListener('click', async () => {
+    // The server takes a few seconds to actually exit (draining open SSE
+    // connections) — flag that now instead of leaving the dot green until
+    // the connection really drops.
+    setConnBadge('connecting');
+    document.getElementById('conn-badge').title = 'Shutting down…';
     await fetch('/quit', { method: 'POST' });
   });
   document.getElementById('prompt-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitPrompt(); }
   });
+
+  applyModeBadge(INITIAL_USE_HARDWARE);
+  document.getElementById('mode-badge').addEventListener('click', toggleHardware);
+
+  document.getElementById('btn-save-run').addEventListener('click', saveRun);
+  document.getElementById('btn-load-run').addEventListener('click', () => {
+    document.getElementById('load-run-input').click();
+  });
+  document.getElementById('load-run-input').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (file) loadRunFile(file);
+    e.target.value = '';
+  });
+
+  if (new URLSearchParams(location.search).has('mock')) {
+    document.addEventListener('keydown', e => {
+      if (e.key === 'r' && document.activeElement !== document.getElementById('prompt-input')) {
+        replayMock();
+      }
+    });
+    replayMock();
+  }
 
   window.addEventListener('resize', () => {
     camera.aspect = container.clientWidth / container.clientHeight;
@@ -531,6 +597,8 @@ function appendMsg(type, text) {
     div.innerHTML = `<div class="msg-label">Agent</div>${escHtml(text)}`;
   } else if (type === 'error') {
     div.innerHTML = `<div class="msg-label error">Error</div>${escHtml(text)}`;
+  } else if (type === 'notice') {
+    div.innerHTML = `<div class="msg-label">System</div>${escHtml(text)}`;
   }
   conv.appendChild(div);
   conv.scrollTop = conv.scrollHeight;
@@ -544,7 +612,7 @@ function appendProposals(tools) {
   const div = document.createElement('div');
   div.className = 'msg msg-proposals';
   const items = tools.map(t =>
-    `<div class="proposal-item"><span class="tool-name">${escHtml(t.name)}</span> — ${escHtml(t.preview)}</div>`
+    `<div class="proposal-item"><div class="tool-name">${escHtml(t.name)}</div><div class="proposal-preview">${escHtml(t.preview)}</div></div>`
   ).join('');
   div.innerHTML =
     `<div class="msg-label">Proposed actions</div>` +
@@ -577,10 +645,18 @@ function disableActiveProposals() {
 }
 
 function setStatus(text) {
-  const el = document.getElementById('status-line');
+  let el = document.getElementById('status-line');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'status-line';
+    document.getElementById('conversation').appendChild(el);
+  }
   if (text) {
     el.innerHTML = `<span class="status-dot"></span>${escHtml(text)}`;
-    el.style.display = '';
+    el.style.display = 'block';
+    const conv = document.getElementById('conversation');
+    conv.appendChild(el); // keep it pinned as the last row, below the latest message
+    conv.scrollTop = conv.scrollHeight;
   } else {
     el.style.display = 'none';
   }
@@ -618,6 +694,8 @@ function handleSSE(evt) {
       break;
     case 'stopped':
       setStatus(null);
+      disableActiveProposals();
+      appendMsg('notice', 'Session stopped — the agent has been disconnected.');
       setRunButton(false);
       break;
     case 'error':
@@ -628,17 +706,219 @@ function handleSSE(evt) {
   }
 }
 
-function connectSSE() {
-  const es = new EventSource('/events');
-  es.onmessage = e => handleSSE(JSON.parse(e.data));
-  es.onerror = () => setTimeout(connectSSE, 2000);
+const _CONN_TITLES = {
+  connected: 'Connected to server',
+  connecting: 'Pending connection',
+  disconnected: 'Disconnected from server',
+};
+
+function setConnBadge(state) {
+  const el = document.getElementById('conn-badge');
+  el.classList.toggle('connected', state === 'connected');
+  el.classList.toggle('connecting', state === 'connecting');
+  el.classList.toggle('disconnected', state === 'disconnected');
+  el.title = _CONN_TITLES[state];
 }
+
+function connectSSE() {
+  setConnBadge('connecting');
+  const es = new EventSource('/events');
+  es.onopen = () => setConnBadge('connected');
+  es.onmessage = e => handleSSE(JSON.parse(e.data));
+  es.onerror = () => {
+    setConnBadge('disconnected');
+    es.close();
+    setTimeout(connectSSE, 2000);
+  };
+}
+
+// ── Mock conversation replay (dev only) ──────────────────────────────────
+// Drives the exact same handleSSE() path the real SSE stream uses, but from
+// a hardcoded script — no server round-trip, no LLM call, same result every
+// time. Use this to iterate on conversation-panel CSS/JS: load once with
+// ?mock=1 (or run replayMock() in the console), then just press "r" to
+// replay after every edit instead of rebooting the app / re-prompting.
+const MOCK_EVENTS = [
+  { type: 'thinking' },
+  { type: 'agent_text', text: "I'll test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates each. Starting by priming the deck." },
+  {
+    type: 'proposals', tools: [
+      {
+        name: 'propose_prime',
+        preview: 'source_plate col 1: Drug A @ 10 µM  (200 µL/well)\nsource_plate col 2: Drug B @ 10 µM  (200 µL/well)\nsource_plate col 3: media/buffer  (200 µL/well)',
+      },
+      {
+        name: 'column_transfer',
+        preview: 'source_plate col 1 → assay_plate col 1  (50 µL)  [transfer_cells]',
+      },
+    ],
+  },
+  { type: 'acting' },
+  { type: 'tool_result', name: 'propose_prime', ok: true },
+  { type: 'tool_result', name: 'column_transfer', ok: false, error: 'tip rack A1 empty' },
+  { type: 'thinking' },
+  { type: 'agent_text', text: 'Tip rack A1 was empty — reloading tips before continuing.' },
+  {
+    type: 'proposals', tools: [
+      { name: 'pick_up_tips', preview: 'tip_rack_2 col 1' },
+    ],
+  },
+  { type: 'acting' },
+  { type: 'tool_result', name: 'pick_up_tips', ok: true },
+  { type: 'done' },
+];
+
+function replayMock(events = MOCK_EVENTS, delayMs = 2000) {
+  document.getElementById('empty-state')?.remove();
+  document.getElementById('conversation').innerHTML = '';
+  setStatus(null);
+  setRunButton(false);
+  events.forEach((evt, i) => setTimeout(() => handleSSE(evt), 1000 + i * delayMs));
+}
+
+// Once a run has produced any state worth clearing, the primary button
+// offers a reset instead of silently letting a new prompt run on top of a
+// dirty deck. Cleared back to false by resetSimulation().
+let sessionDirty = false;
 
 function setRunButton(running) {
   const btn = document.getElementById('btn-run');
   btn.classList.toggle('running', running);
-  btn.textContent = running ? '■ Stop' : '▶ Run simulation';
+  if (running) {
+    btn.textContent = '■ Stop';
+  } else if (sessionDirty) {
+    btn.textContent = '↺ Reset simulation';
+  } else {
+    btn.textContent = '▶ Run simulation';
+  }
   document.getElementById('prompt-input').disabled = running;
+  document.getElementById('mode-badge').disabled = running;
+  document.getElementById('model-picker').disabled = running;
+}
+
+async function resetSimulation() {
+  await fetch('/reset', { method: 'POST' });
+
+  isPlaying = false;
+  followLive = true;
+  animState = null;
+  if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
+
+  FRAMES = [];
+  currentFrameIdx = -1;
+  document.getElementById('slider').max = 0;
+  document.getElementById('slider').value = 0;
+  updatePlayBtn();
+  updateLiveBtn();
+
+  snapPipette(GEOMETRY.home_pos);
+  const frame = { snapshot: initialSnapshot() };
+  updateWells(frame.snapshot);
+  updateTipSpots(frame.snapshot);
+  tipOnPipette.forEach(m => { m.visible = false; });
+  renderTree(frame);
+  renderLegend(frame);
+  _compoundHues.clear();
+
+  document.getElementById('step-label').innerHTML = '';
+  document.getElementById('args').textContent = '';
+  document.getElementById('message').style.display = 'none';
+
+  document.getElementById('conversation').innerHTML =
+    '<div id="empty-state">Enter an experiment prompt below.<br><br>' +
+    'The agent will explain each step here<br>as it designs and runs the experiment.</div>';
+  setStatus(null);
+
+  sessionDirty = false;
+  setRunButton(false);
+}
+
+// ── Simulation / hardware mode ───────────────────────────────────────────
+function applyModeBadge(isHardware) {
+  const badge = document.getElementById('mode-badge');
+  badge.classList.remove('mode-pending');
+  badge.classList.toggle('mode-hardware', isHardware);
+  badge.textContent = isHardware ? 'Hardware' : 'Simulation';
+  badge.title = `Click to switch to ${isHardware ? 'Simulation' : 'Hardware'}`;
+}
+
+async function toggleHardware() {
+  const badge = document.getElementById('mode-badge');
+  const goingToHardware = badge.textContent !== 'Hardware';
+
+  // Immediate feedback: don't leave the badge looking unchanged while we
+  // wait on a real USB connection attempt, which can take a moment.
+  badge.disabled = true;
+  badge.classList.add('mode-pending');
+  badge.textContent = goingToHardware ? 'Connecting…' : 'Switching…';
+
+  let res, data;
+  try {
+    res = await fetch('/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_hardware: goingToHardware }),
+    });
+    data = await res.json();
+  } catch (err) {
+    appendMsg('error', `Failed to reach server: ${err}`);
+    badge.disabled = false;
+    applyModeBadge(!goingToHardware);
+    return;
+  }
+
+  badge.disabled = false;
+  if (!res.ok) {
+    appendMsg('error', data.error || 'Failed to switch mode.');
+    applyModeBadge(!goingToHardware);
+    return;
+  }
+
+  applyModeBadge(data.use_hardware);
+}
+
+// ── Save / load a run ─────────────────────────────────────────────────────
+function saveRun() {
+  if (FRAMES.length === 0) return;
+  const payload = { title: document.title, savedAt: new Date().toISOString(), frames: FRAMES };
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `run-${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function loadRunFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    let data;
+    try {
+      data = JSON.parse(reader.result);
+    } catch {
+      appendMsg('error', 'Could not parse run file — not valid JSON.');
+      return;
+    }
+    if (!Array.isArray(data.frames) || data.frames.length === 0) {
+      appendMsg('error', 'Run file has no frames to play back.');
+      return;
+    }
+
+    isPlaying = false;
+    followLive = false;
+    animState = null;
+    if (playTimeout) { clearTimeout(playTimeout); playTimeout = null; }
+
+    FRAMES = data.frames;
+    document.getElementById('slider').max = FRAMES.length - 1;
+    goToFrame(0, false);
+    updatePlayBtn();
+    updateLiveBtn();
+    sessionDirty = true;
+    setRunButton(false);
+  };
+  reader.readAsText(file);
 }
 
 async function submitPrompt() {
@@ -646,6 +926,7 @@ async function submitPrompt() {
   const input = document.getElementById('prompt-input');
 
   if (btn.classList.contains('running')) { await submitStop(); return; }
+  if (sessionDirty) { await resetSimulation(); return; }
 
   const goal = input.value.trim();
   if (!goal) return;
@@ -653,21 +934,26 @@ async function submitPrompt() {
   appendMsg('user', goal);
   input.value = '';
   setRunButton(true);
+  sessionDirty = true;
 
   FRAMES = [];
+  currentFrameIdx = -1;
   document.getElementById('slider').max = 0;
   document.getElementById('slider').value = 0;
   followLive = true;
   updateLiveBtn();
+  _compoundHues.clear();
 
+  const provider = document.getElementById('model-picker').value;
   const res = await fetch('/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ goal }),
+    body: JSON.stringify({ goal, provider }),
   });
   if (!res.ok) {
     const data = await res.json();
     appendMsg('error', data.error || 'Failed to start run.');
+    sessionDirty = false; // nothing actually started — plain "Run" is still correct
     setRunButton(false);
   }
 }
@@ -682,7 +968,22 @@ async function submitConfirm() {
 }
 
 async function submitStop() {
-  await fetch('/stop', { method: 'POST' });
+  try {
+    await fetch('/stop', { method: 'POST' });
+  } catch (err) {
+    appendMsg('error', `Failed to reach server: ${err}`);
+    return;
+  }
+  // The 'stopped' SSE broadcast normally drives the UI update (see
+  // handleSSE) — this is a safety net in case the SSE connection happens to
+  // be down right when /stop completes, which would otherwise leave the
+  // button stuck reading "Stop" even though the server-side session really
+  // did end.
+  setTimeout(() => {
+    if (document.getElementById('btn-run').classList.contains('running')) {
+      handleSSE({ type: 'stopped' });
+    }
+  }, 1500);
 }
 
 init();

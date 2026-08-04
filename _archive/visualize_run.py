@@ -18,7 +18,7 @@ import os
 import urllib.request
 import webbrowser
 
-from agent import _dispatch, _preview
+from agent import _dispatch, preview_tool
 from star_sim import RobotEnv
 from pylabrobot.resources import Resource
 
@@ -275,7 +275,7 @@ async def _replay_one(
     return {
         "step": step_idx,
         "tool": name,
-        "preview": _preview(name, args),
+        "preview": preview_tool(name, args),
         "message": message,
         "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
         "movements": movements,
@@ -359,7 +359,7 @@ class LiveCapture:
         self.frames.append({
             "step": step_idx,
             "tool": name,
-            "preview": _preview(name, args),
+            "preview": preview_tool(name, args),
             "message": message,
             "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
             "movements": movements,

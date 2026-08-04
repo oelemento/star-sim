@@ -3,6 +3,7 @@ import os
 
 import urllib
 
+from agent import preview_tool
 from star_sim.env import RobotEnv
 from pylabrobot.resources import Resource
 
@@ -187,6 +188,39 @@ def _tip_col_center(rack_name: str, col: int, geometry: dict) -> dict | None:
 _SHOW_TIPS_AFTER = {"pick_up_tips": True, "discard_tips": False}
 
 
+def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
+    """Full well-contents + tip-rack state, for coloring wells/tips in the 3D view."""
+    snap: dict = {}
+    for plate_name in ("source_plate", "dest_plate"):
+        plate = getattr(env.layout, plate_name)
+        plate_wells: dict = {}
+        for row in _ROWS:
+            for col in _COLS:
+                well_id = f"{row}{col}"
+                volume = plate.get_item(well_id).tracker.get_used_volume()
+                contents = env.plate_map.get_well(plate_name, well_id)
+                entry = {"volume": round(volume, 1)}
+                if contents and contents.compounds:
+                    entry["compounds"] = [
+                        {"name": c.name, "conc": round(c.concentration_um, 3)}
+                        for c in contents.compounds
+                    ]
+                if contents and contents.cells:
+                    entry["cells"] = contents.cells
+                plate_wells[well_id] = entry
+        snap[plate_name] = plate_wells
+
+    tip_racks: dict = {}
+    for rack_name in tip_rack_names:
+        rack = env.layout.deck.get_resource(rack_name)
+        tip_racks[rack_name] = {
+            spot.name[len(f"{rack_name}_tipspot_"):]: spot.tracker.has_tip
+            for spot in rack.children
+        }
+    snap["tip_racks"] = tip_racks
+    return snap
+
+
 def _movement_target(kind: str, info: dict, geometry: dict) -> dict | None:
     if kind == "pick_up_tips":
         return _tip_col_center(info["rack"], info["col"], geometry)
@@ -197,16 +231,16 @@ def _movement_target(kind: str, info: dict, geometry: dict) -> dict | None:
     return None
 
 
-def _initial_frame(geometry: dict) -> dict:
-    return {"step": -1, 
-            "pipette_pos": geometry["home_pos"], 
-            "movements": []}
-    
-    
-def _done_frame(record_len: int) -> dict:
-    return {"step": record_len,
-            "pipette_pos": None,
-            "movements": []}
+def _initial_frame(geometry: dict, env: RobotEnv, tip_rack_names: list[str]) -> dict:
+    return {"step": -1, "tool": "initial", "preview": "", "message": None,
+            "pipette_pos": geometry["home_pos"], "movements": [],
+            "snapshot": _snapshot(env, tip_rack_names)}
+
+
+def _done_frame(record_len: int, env: RobotEnv, tip_rack_names: list[str], final_text: str) -> dict:
+    return {"step": record_len, "tool": "done", "preview": "", "message": final_text,
+            "pipette_pos": None, "movements": [],
+            "snapshot": _snapshot(env, tip_rack_names)}
 
 
 class LiveCapture:
@@ -224,7 +258,7 @@ class LiveCapture:
         self.env = env
         self.geometry = geometry
         self.tip_rack_names = geometry["tip_rack_names"]
-        self.frames: list[dict] = [_initial_frame(geometry)]
+        self.frames: list[dict] = [_initial_frame(geometry, env, self.tip_rack_names)]
         self._pending: list[dict] = []
         self._step_idx = 0
         env.add_movement_listener(self._on_movement)
@@ -234,7 +268,7 @@ class LiveCapture:
             "kind": kind,
             "pipette_pos": _movement_target(kind, info, self.geometry),
             "show_tips": _SHOW_TIPS_AFTER.get(kind),
-            # "snapshot": _snapshot(self.env, self.tip_rack_names),
+            "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
     def record_step(self, name: str, args: dict, message: str | None, error: str | None) -> None:
@@ -244,18 +278,18 @@ class LiveCapture:
             return
         self.frames.append({
             "step": step_idx,
-            # "tool": name,
-            # "preview": _preview(name, args),
-            # "message": message,
+            "tool": name,
+            "preview": preview_tool(name, args),
+            "message": message,
             "pipette_pos": movements[-1]["pipette_pos"] if movements else None,
             "movements": movements,
             "error": error,
-            # "snapshot": _snapshot(self.env, self.tip_rack_names),
+            "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
     def finish(self, final_text: str | None) -> None:
         if final_text:
-            self.frames.append(_done_frame(self._step_idx))
+            self.frames.append(_done_frame(self._step_idx, self.env, self.tip_rack_names, final_text))
 
     def close(self) -> None:
         self.env.remove_movement_listener(self._on_movement)
@@ -266,7 +300,8 @@ class LiveCapture:
 
 def render_html(geometry: dict, frames: list[dict], title: str,
                 live: bool = False,
-                frames_url: str = "") -> str:
+                frames_url: str = "",
+                use_hardware: bool = False) -> str:
     js = _fetch_js()
     three_js         = (js or {}).get("three.js", "")
     orbit_js         = (js or {}).get("OrbitControls.js", "")
@@ -274,13 +309,14 @@ def render_html(geometry: dict, frames: list[dict], title: str,
     # Live mode: default to the newest known frame so a still-running
     # experiment's tab opens already caught up, rather than at frame 0.
     start_step = max_step if live else 0
-    template = open(os.path.join(os.path.dirname(__file__), "app_template.html")).read()
+    template = open(os.path.join(os.path.dirname(__file__), "static", "app.html")).read()
     return (
         template
         .replace("__TITLE__", title)
         .replace("__MAX_STEP__", str(max_step))
         .replace("__START_STEP__", str(start_step))
         .replace("__LIVE__", "true" if live else "false")
+        .replace("__USE_HARDWARE__", "true" if use_hardware else "false")
         .replace("__FRAMES_URL__", frames_url)
         .replace("__GEOMETRY_JSON__", json.dumps(geometry))
         .replace("__FRAMES_JSON__", json.dumps(frames))

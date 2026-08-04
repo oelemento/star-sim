@@ -17,6 +17,7 @@ import asyncio
 import json
 import threading
 import time
+import traceback
 import webbrowser
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -26,7 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import AgentSession, _preview, build_client
+from agent import AgentSession, preview_tool, build_client
 from star_sim import RobotEnv
 from render import LiveCapture, geometry, render_html
 
@@ -45,6 +46,13 @@ class _State:
         self.env: RobotEnv | None = None
         self.capture: LiveCapture | None = None
         self.frames: list[dict] = []
+        # The currently running _think()/_act_then_think() task, if any — so
+        # /stop and /reset can actually cancel work in flight instead of just
+        # tearing down state out from under a task that's still running.
+        self.active_task: asyncio.Task | None = None
+
+        # Backend for the *next* run started via /run. Changed via /mode.
+        self.use_hardware: bool = False
 
         # SSE subscribers: one asyncio.Queue per open browser tab
         self._queues: list[asyncio.Queue] = []
@@ -64,6 +72,18 @@ class _State:
             self._queues.remove(q)
         except ValueError:
             pass
+
+    async def cancel_active_task(self) -> None:
+        """Cancel the in-flight _think()/_act_then_think() task, if any, and wait
+        for it to actually unwind before the caller tears down env/session out
+        from under it."""
+        if self.active_task and not self.active_task.done():
+            self.active_task.cancel()
+            try:
+                await self.active_task
+            except asyncio.CancelledError:
+                pass
+        self.active_task = None
 
     async def teardown(self) -> None:
         """Detaches listener from env, then also tears down RobotEnv and disconnects
@@ -113,30 +133,66 @@ async def index():
         geometry=_state.geometry,
         frames=[],
         title="live run",
+        use_hardware=_state.use_hardware,
     )
     return HTMLResponse(html)
 
 
 class RunRequest(BaseModel):
     goal: str
+    provider: str = "groq"
 
 
 @app.post("/run")
 async def start_run(req: RunRequest):
     """Start a new session: set up the env and run the first think()."""
     if _state.session is not None:
+        await _state.cancel_active_task()
         await _state.teardown()
 
-    _state.env = RobotEnv(use_hardware=False)
+    _state.env = RobotEnv(use_hardware=_state.use_hardware)
     await _state.env.setup()
 
     _state.capture = LiveCapture(_state.env, _state.geometry)
     _state.frames = _state.capture.frames
 
-    _state.session = AgentSession(env=_state.env, client=build_client("groq", req.goal))
+    _state.session = AgentSession(env=_state.env, client=build_client(req.provider, req.goal))
 
-    asyncio.create_task(_think())
+    _state.active_task = asyncio.create_task(_think())
     return JSONResponse({"ok": True})
+
+
+@app.post("/reset")
+async def reset():
+    """Discard any leftover session/env state and go back to a clean deck.
+    Safe to call even when nothing is running — teardown() is idempotent."""
+    await _state.cancel_active_task()
+    await _state.teardown()
+    return JSONResponse({"ok": True})
+
+
+class ModeRequest(BaseModel):
+    use_hardware: bool
+
+
+@app.post("/mode")
+async def set_mode(req: ModeRequest):
+    """Switch the backend used by the *next* /run. Connects (and immediately
+    disconnects) a real STAR to verify hardware is reachable before committing —
+    /run only ever sees a mode that's already been proven to work."""
+    if _state.session is not None:
+        return JSONResponse({"error": "cannot switch mode while a run is active"}, status_code=400)
+
+    if req.use_hardware:
+        probe = RobotEnv(use_hardware=True)
+        try:
+            await probe.setup()
+        except Exception as exc:
+            return JSONResponse({"error": f"could not connect to hardware: {exc}"}, status_code=400)
+        await probe.teardown()
+
+    _state.use_hardware = req.use_hardware
+    return JSONResponse({"ok": True, "use_hardware": _state.use_hardware})
 
 
 @app.post("/confirm")
@@ -145,12 +201,13 @@ async def confirm():
     if _state.session is None:
         return JSONResponse({"error": "no active session"}, status_code=400)
 
-    asyncio.create_task(_act_then_think())
+    _state.active_task = asyncio.create_task(_act_then_think())
     return JSONResponse({"ok": True})
 
 
 @app.post("/stop")
 async def stop():
+    await _state.cancel_active_task()
     await _state.teardown()
     _state.broadcast({"type": "stopped"})
     return JSONResponse({"ok": True})
@@ -204,12 +261,13 @@ async def _think() -> None:
             _state.broadcast({"type": "done"})
         else:
             proposals = [
-                {"name": name, "preview": _preview(name, args)}
+                {"name": name, "preview": preview_tool(name, args)}
                 for _, name, args in response.tool_uses
             ]
             _state.broadcast({"type": "proposals", "tools": proposals})
 
     except Exception as exc:
+        traceback.print_exc()
         _state.broadcast({"type": "error", "message": str(exc)})
         await _state.teardown()
 
@@ -231,6 +289,7 @@ async def _act_then_think() -> None:
         _state.broadcast({"type": "acting"})
         await _state.session.act(step_delay=0.3, on_step=on_step)
     except Exception as exc:
+        traceback.print_exc()
         _state.broadcast({"type": "error", "message": str(exc)})
         await _state.teardown()
         return
@@ -258,4 +317,11 @@ if __name__ == "__main__":
         daemon=True,
     ).start()
 
-    uvicorn.run("app:app", host="127.0.0.1", port=args.port, reload=args.reload)
+    # Open SSE connections would otherwise make uvicorn wait forever for them
+    # to close before it finishes shutting down (our lifespan hook sends a
+    # sentinel to unblock them, but uvicorn's "wait for connections" phase
+    # runs before it invokes that hook — a deadlock without this bound).
+    uvicorn.run(
+        "app:app", host="127.0.0.1", port=args.port, reload=args.reload,
+        timeout_graceful_shutdown=2,
+    )

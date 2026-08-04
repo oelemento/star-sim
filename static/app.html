@@ -15,7 +15,8 @@
     <div id="left-header">
       <h1>Hamilton STAR - Digital Twin</h1>
       <div style="display:flex;gap:6px;align-items:center">
-        <span id="mode-badge">Simulation</span>
+        <span id="conn-badge" class="conn-dot" title="Connecting to server…"></span>
+        <button id="mode-badge" title="Click to switch to Hardware">Simulation</button>
         <button id="btn-quit" title="Shut down server">&#x2715;</button>
       </div>
     </div>
@@ -25,9 +26,8 @@
         Enter an experiment prompt below.<br><br>
         The agent will explain each step here<br>as it designs and runs the experiment.
       </div>
+      <div id="status-line"></div>
     </div>
-
-    <div id="status-line"></div>
 
     <div id="step-info">
       <div id="step-label"></div>
@@ -42,14 +42,22 @@
         <button id="btn-step-anim">&#9654;&#9614; Step</button>
         <button id="btn-fwd">&#9654;|</button>
         <button id="btn-live">&#9679; Live</button>
+        <button id="btn-save-run" title="Save this run to a file">&#8681; Save</button>
+        <button id="btn-load-run" title="Load a saved run from a file">&#8679; Load</button>
+        <input id="load-run-input" type="file" accept="application/json" style="display:none">
       </div>
       <input id="slider" type="range" min="0" max="__MAX_STEP__" value="__START_STEP__">
     </div>
 
     <div id="prompt-area">
       <textarea id="prompt-input"
-        placeholder="Describe the experiment in plain language, e.g. ' Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates each.'"></textarea>
+        placeholder="Describe the experiment in plain language, e.g. Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates for each condition, including controls."></textarea>
       <div id="prompt-actions">
+        <select id="model-picker" title="Model used to drive the agent">
+          <option value="anthropic">Claude (Anthropic)</option>
+          <option value="groq" selected>gpt-oss (Groq)</option>
+          <option value="ollama">Llama (Ollama)</option>
+        </select>
         <button id="btn-run">&#9654; Run simulation</button>
       </div>
     </div>
@@ -73,6 +81,7 @@
     const GEOMETRY = __GEOMETRY_JSON__;
     let FRAMES = __FRAMES_JSON__;
     const START_STEP = __START_STEP__;
+    const INITIAL_USE_HARDWARE = __USE_HARDWARE__;
   </script>
 
   <script>__THREEJS__</script>

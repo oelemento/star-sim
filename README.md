@@ -10,37 +10,20 @@ Built as a safe testbed for AI-directed liquid-handling experiments.
 - Develop and validate protocols with **no robot and no risk** — overfills,
   missing tips, and empty-well aspirations surface in software, not on hardware.
 - Volume and tip state are tracked, so the twin reflects real deck state.
-- One flag (`--hardware`) flips the exact same code onto the real STAR later.
+- Natural language interface for developing a sequence of experimental operations.
+- Deploys directly to simulation backend or physical Hamilton at the press of a button.
 
 ## Install
 
 ```bash
-pip3.11 install --user -r requirements.txt
+pip install --user -r requirements.txt
 ```
 
 ## Run
 
 ```bash
-# Headless simulation (prints every tool call and result):
-python run.py
-
-# Simulation with the live 3D browser visualizer:
-python run.py --visualize
-
-# Custom experiment goal:
-python run.py --goal "dispense 50 uL from source column 1 into dest columns 1 through 4"
-
-# Drive the physical Hamilton STAR over USB (no visualizer):
-python run.py --hardware
-
-# Save the agent's steps as a JSON replay file:
-python run.py --record
-
-# Replay a previously recorded run as a scripted run:
-python run.py --replay runs/2026-06-11T12-00-00.json
-
-# Step through each tool call for review:
-python run.py --confirm
+# Launches the app 
+python app.py
 ```
 
 ## Layout
@@ -56,5 +39,5 @@ protocols/
   serial_dilution.py   demo: 8-channel 2-fold serial dilution (unused)
   primitives.py        protocol primitives used by the agent such as single-use column transfer or serial transfer
 agent.py      Claude-based, local Ollama-based, and scripted runs
-run.py        CLI entry point
+app.py        Uvicorn app, exposes browser-based interface
 ```
