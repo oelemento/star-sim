@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import AgentSession, preview_tool, build_client
+from agent import AgentSession, preview_tool, build_client, describe_llm_error
 from star_sim import RobotEnv
 from render import LiveCapture, geometry, render_html
 
@@ -205,6 +205,22 @@ async def confirm():
     return JSONResponse({"ok": True})
 
 
+class RedirectRequest(BaseModel):
+    message: str
+
+
+@app.post("/redirect")
+async def redirect(req: RedirectRequest):
+    """User declined the proposed tool uses and wants to steer the agent
+    elsewhere instead — decline them and think() again with the new message."""
+    if _state.session is None:
+        return JSONResponse({"error": "no active session"}, status_code=400)
+
+    _state.session.redirect(req.message)
+    _state.active_task = asyncio.create_task(_think())
+    return JSONResponse({"ok": True})
+
+
 @app.post("/stop")
 async def stop():
     await _state.cancel_active_task()
@@ -267,15 +283,19 @@ async def _think() -> None:
             _state.broadcast({"type": "proposals", "tools": proposals})
 
     except Exception as exc:
-        traceback.print_exc()
-        _state.broadcast({"type": "error", "message": str(exc)})
+        message = describe_llm_error(exc)
+        if message == str(exc):
+            traceback.print_exc()  # unrecognized shape — keep the full trace for debugging
+        else:
+            print(f"\n[error] {message}")
+        _state.broadcast({"type": "error", "message": message})
         await _state.teardown()
 
 
 async def _act_then_think() -> None:
     """Execute the pending tool uses, update the visualization, then think() again."""
     async def on_step(name: str, args: dict, message: str | None, result: dict) -> None:
-        _state.capture.record_step(name, args, message, result.get("error"))
+        frame = _state.capture.record_step(name, args, message, result.get("error"))
         _state.frames = _state.capture.frames
         _state.broadcast({
             "type": "tool_result",
@@ -283,14 +303,19 @@ async def _act_then_think() -> None:
             "ok": "error" not in result,
             "error": result.get("error"),
         })
-        _state.broadcast({"type": "frame", "data": _state.capture.frames[-1]})
+        if frame is not None:
+            _state.broadcast({"type": "frame", "data": frame})
 
     try:
         _state.broadcast({"type": "acting"})
         await _state.session.act(step_delay=0.3, on_step=on_step)
     except Exception as exc:
-        traceback.print_exc()
-        _state.broadcast({"type": "error", "message": str(exc)})
+        message = describe_llm_error(exc)
+        if message == str(exc):
+            traceback.print_exc()  # unrecognized shape — keep the full trace for debugging
+        else:
+            print(f"\n[error] {message}")
+        _state.broadcast({"type": "error", "message": message})
         await _state.teardown()
         return
 

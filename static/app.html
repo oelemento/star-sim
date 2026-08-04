@@ -54,9 +54,8 @@
         placeholder="Describe the experiment in plain language, e.g. Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates for each condition, including controls."></textarea>
       <div id="prompt-actions">
         <select id="model-picker" title="Model used to drive the agent">
-          <option value="anthropic">Claude (Anthropic)</option>
-          <option value="groq" selected>gpt-oss (Groq)</option>
-          <option value="ollama">Llama (Ollama)</option>
+          <option value="anthropic">Claude Opus 4.8</option>
+          <option value="groq" selected>gpt-oss-120b (Groq)</option>
         </select>
         <button id="btn-run">&#9654; Run simulation</button>
       </div>
@@ -66,6 +65,7 @@
 
   <!-- ── CENTER: 3D CANVAS ──────────────────────────────────── -->
   <div id="canvas-container"></div>
+  <div id="hover-tooltip"></div>
 
   <!-- ── RIGHT PANEL ────────────────────────────────────────── -->
   <div id="tree-col">

@@ -339,8 +339,8 @@ class AnthropicClient:
             for tid, r in results
         ]})
 
-    # def inject_user_message(self, text: str) -> None:
-    #     self._messages.append({"role": "user", "content": text})
+    def inject_user_message(self, text: str) -> None:
+        self._messages.append({"role": "user", "content": text})
 
 
 def _to_openai_tools(tools: list[dict]) -> list[dict]:
@@ -399,8 +399,8 @@ class OpenAICompatClient:
                 "content": json.dumps(r),
             })
 
-    # def inject_user_message(self, text: str) -> None:
-    #     self._messages.append({"role": "user", "content": text})
+    def inject_user_message(self, text: str) -> None:
+        self._messages.append({"role": "user", "content": text})
         
         
 _PROVIDER_DEFAULTS: dict[str, dict] = {
@@ -445,6 +445,29 @@ def build_client(
         base_url=resolved_url,
         api_key=api_key,
     )
+
+
+def describe_llm_error(exc: Exception) -> str:
+    """One clean line for a provider API error, instead of the raw dump both
+    the openai and anthropic SDKs produce by default.
+
+    Both SDKs build their exception's message/str() as literally
+    `f"Error code: {status_code} - {body}"` — a Python dict repr glued onto a
+    prefix, unpleasant to read and useless for a non-engineer. The actual
+    human-readable text lives one level down at body["error"]["message"];
+    both SDKs shape `.body` identically (duck-typed here so this works for
+    either without importing both exception hierarchies).
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        err = body["error"]
+        message = err.get("message")
+        if message:
+            status = getattr(exc, "status_code", None)
+            prefix = f"HTTP {status}" if status else "API error"
+            code = f" [{err['code']}]" if err.get("code") else ""
+            return f"{prefix}{code}: {message}"
+    return str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -513,9 +536,22 @@ class AgentSession:
         self._client.submit_tool_results(results)
         self._pending_tool_uses = []
 
-    # def inject_message(self, text: str) -> None:
-    #     """Inject a user message into the conversation (e.g. mid-run feedback)."""
-    #     self._client.inject_user_message(text)
+    def redirect(self, text: str) -> None:
+        """Decline the tool uses proposed by the last think() and steer the agent
+        elsewhere instead of running them.
+
+        Both provider APIs require every outstanding tool_use to get a matching
+        tool_result before a new plain user turn is valid, so each pending call
+        is marked skipped (never dispatched) rather than actually executed.
+        """
+        if self._pending_tool_uses:
+            skipped = [
+                (tid, {"skipped": True, "reason": "redirected by user"})
+                for tid, _, _ in self._pending_tool_uses
+            ]
+            self._client.submit_tool_results(skipped)
+            self._pending_tool_uses = []
+        self._client.inject_user_message(text)
 
 
 # ---------------------------------------------------------------------------

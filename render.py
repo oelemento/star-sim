@@ -271,12 +271,17 @@ class LiveCapture:
             "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
-    def record_step(self, name: str, args: dict, message: str | None, error: str | None) -> None:
+    def record_step(self, name: str, args: dict, message: str | None, error: str | None) -> dict | None:
+        """Returns the new frame, or None for a call that isn't a real step (just
+        observe() today — a read-only query that never moves anything). The
+        caller must not broadcast a "frame" event when this returns None: there
+        is nothing new to show, and re-sending the previous frame as if it were
+        fresh replays its animation and throws off the step count."""
         movements, self._pending = self._pending, []
-        step_idx, self._step_idx = self._step_idx, self._step_idx + 1
         if name == "observe":
-            return
-        self.frames.append({
+            return None
+        step_idx, self._step_idx = self._step_idx, self._step_idx + 1
+        frame = {
             "step": step_idx,
             "tool": name,
             "preview": preview_tool(name, args),
@@ -285,7 +290,9 @@ class LiveCapture:
             "movements": movements,
             "error": error,
             "snapshot": _snapshot(self.env, self.tip_rack_names),
-        })
+        }
+        self.frames.append(frame)
+        return frame
 
     def finish(self, final_text: str | None) -> None:
         if final_text:

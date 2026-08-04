@@ -41,3 +41,9 @@ protocols/
 agent.py      Claude-based, local Ollama-based, and scripted runs
 app.py        Uvicorn app, exposes browser-based interface
 ```
+
+## TODO
+- Branching experimental designs
+- Dynamic and easily configurable deck layouts
+- Single-channel pipetting
+- Full documentation

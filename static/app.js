@@ -60,10 +60,16 @@ function colorForWell(entry) {
   const c = new THREE.Color();
   if (!entry || entry.volume <= 0) { c.set(0xffffff); return c; }
   if (entry.compounds && entry.compounds.length) {
-    const comp = entry.compounds[0];
-    const hue = hueForName(comp.name);
-    const pct = Math.min(comp.conc / 200, 1);
-    c.setHSL(hue / 360, 0.72, 0.8 - pct * 0.5);
+    const hues = entry.compounds.map(comp => hueForName(comp.name));
+    const hue = hues.reduce((a, b) => a + b, 0) / hues.length;
+    const maxConc = Math.max(...entry.compounds.map(comp => comp.conc || 0));
+    const pct = Math.min(maxConc / 200, 1);
+    // A blended hue alone can't be told apart from some other single pure
+    // compound that happens to land at the same average — desaturating a
+    // mix instead marks it as visually distinct from any single-compound
+    // well. Hover for the exact contents rather than reading it off color.
+    const sat = hues.length > 1 ? 0.35 : 0.72;
+    c.setHSL(hue / 360, sat, 0.8 - pct * 0.5);
     return c;
   }
   if (entry.cells) { c.set(0xa8d4ff); return c; }
@@ -154,8 +160,65 @@ function buildPipette() {
   }
 }
 
+// ── Hover tooltip ────────────────────────────────────────────────────────
+// wellMeshes/tipMeshes/boxMeshes never change membership after init(), so
+// the raycast target list is built once (see init()) rather than rebuilt on
+// every mousemove.
+let _hoverTargets = [];
+const _raycaster = new THREE.Raycaster();
+const _mouseNDC = new THREE.Vector2();
+
+function tooltipText(kind, key) {
+  if (kind === 'well') {
+    const [plate, id] = key.split(':');
+    const entry = currentSnapshot?.[plate]?.[id];
+    if (!entry || entry.volume <= 0) return `${plate} ${id}\nempty`;
+    const lines = [`${plate} ${id}`, `${entry.volume} µL`];
+    for (const comp of entry.compounds || []) lines.push(`${comp.name} @ ${comp.conc} µM`);
+    if (entry.cells) lines.push(`cells: ${entry.cells}`);
+    return lines.join('\n');
+  }
+  if (kind === 'tip') {
+    const [rack, pos] = key.split(':');
+    const hasTip = !!currentSnapshot?.tip_racks?.[rack]?.[pos];
+    return `${rack} ${pos}\n${hasTip ? 'tip loaded' : 'empty'}`;
+  }
+  return key; // box: just the resource name
+}
+
+function hideTooltip() {
+  document.getElementById('hover-tooltip').style.display = 'none';
+}
+
+function onCanvasMouseMove(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  _mouseNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  _mouseNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  _raycaster.setFromCamera(_mouseNDC, camera);
+
+  const hits = _raycaster.intersectObjects(_hoverTargets.map(t => t.mesh));
+  if (hits.length === 0) { hideTooltip(); return; }
+
+  const target = _hoverTargets.find(t => t.mesh === hits[0].object);
+  if (!target) { hideTooltip(); return; }
+
+  const tooltip = document.getElementById('hover-tooltip');
+  tooltip.textContent = tooltipText(target.kind, target.key);
+  tooltip.style.display = 'block';
+  const margin = 14;
+  const maxLeft = window.innerWidth - tooltip.offsetWidth - margin;
+  const maxTop = window.innerHeight - tooltip.offsetHeight - margin;
+  tooltip.style.left = `${Math.min(e.clientX + margin, Math.max(margin, maxLeft))}px`;
+  tooltip.style.top = `${Math.min(e.clientY + margin, Math.max(margin, maxTop))}px`;
+}
+
 // ── Per-frame state updates ────────────────────────────────────────────
+// Kept in sync with whatever's currently drawn so the hover tooltip can look
+// up exact contents without needing its own separate "current frame" state.
+let currentSnapshot = null;
+
 function updateWells(snapshot) {
+  currentSnapshot = snapshot;
   for (const [key, mesh] of Object.entries(wellMeshes)) {
     const [plate, id] = key.split(':');
     const entry = snapshot[plate]?.[id];
@@ -516,10 +579,20 @@ function init() {
     goToFrame(START_STEP, false);
   } else {
     const frame = { snapshot: initialSnapshot() };
+    updateWells(frame.snapshot);
+    updateTipSpots(frame.snapshot);
     renderTree(frame);
     renderLegend(frame);
   }
   renderLoop(0);
+
+  _hoverTargets = [
+    ...Object.entries(wellMeshes).map(([key, mesh]) => ({ mesh, kind: 'well', key })),
+    ...Object.entries(tipMeshes).map(([key, mesh]) => ({ mesh, kind: 'tip', key })),
+    ...Object.entries(boxMeshes).map(([name, { mesh }]) => ({ mesh, kind: 'box', key: name })),
+  ];
+  renderer.domElement.addEventListener('mousemove', onCanvasMouseMove);
+  renderer.domElement.addEventListener('mouseleave', hideTooltip);
 
   document.getElementById('btn-play').addEventListener('click', togglePlay);
   document.getElementById('btn-back').addEventListener('click', stepBack);
@@ -674,10 +747,14 @@ function handleSSE(evt) {
     case 'proposals':
       setStatus(null);
       appendProposals(evt.tools);
+      phase = 'awaiting';
+      render();
       break;
     case 'acting':
       disableActiveProposals();
       setStatus('Executing…');
+      phase = 'busy';
+      render();
       break;
     case 'tool_result':
       appendToolResult(evt.name, evt.ok, evt.error);
@@ -781,19 +858,36 @@ function replayMock(events = MOCK_EVENTS, delayMs = 2000) {
 // dirty deck. Cleared back to false by resetSimulation().
 let sessionDirty = false;
 
-function setRunButton(running) {
+// 'idle'     — nothing running; button is Run or Reset depending on sessionDirty.
+// 'busy'     — agent is thinking or executing tools; no user input accepted.
+// 'awaiting' — tools were proposed but not yet confirmed; the prompt box is
+//              open again so the user can redirect instead of just confirming.
+let phase = 'idle';
+
+function render() {
   const btn = document.getElementById('btn-run');
-  btn.classList.toggle('running', running);
-  if (running) {
+  btn.classList.toggle('running', phase === 'busy');
+  if (phase === 'busy') {
     btn.textContent = '■ Stop';
+  } else if (phase === 'awaiting') {
+    btn.textContent = '↻ Redirect';
   } else if (sessionDirty) {
     btn.textContent = '↺ Reset simulation';
   } else {
     btn.textContent = '▶ Run simulation';
   }
-  document.getElementById('prompt-input').disabled = running;
-  document.getElementById('mode-badge').disabled = running;
-  document.getElementById('model-picker').disabled = running;
+  const input = document.getElementById('prompt-input');
+  input.disabled = phase === 'busy';
+  input.placeholder = phase === 'awaiting'
+    ? "Don't like the proposed actions? Describe what to do instead, or confirm below."
+    : "Describe the experiment in plain language, e.g. Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates for each condition, including controls.";
+  document.getElementById('mode-badge').disabled = phase === 'busy';
+  document.getElementById('model-picker').disabled = phase === 'busy';
+}
+
+function setRunButton(running) {
+  phase = running ? 'busy' : 'idle';
+  render();
 }
 
 async function resetSimulation() {
@@ -922,10 +1016,10 @@ function loadRunFile(file) {
 }
 
 async function submitPrompt() {
-  const btn = document.getElementById('btn-run');
   const input = document.getElementById('prompt-input');
 
-  if (btn.classList.contains('running')) { await submitStop(); return; }
+  if (phase === 'busy') { await submitStop(); return; }
+  if (phase === 'awaiting') { await submitRedirect(); return; }
   if (sessionDirty) { await resetSimulation(); return; }
 
   const goal = input.value.trim();
@@ -960,10 +1054,34 @@ async function submitPrompt() {
 
 async function submitConfirm() {
   disableActiveProposals();
+  phase = 'busy';
+  render();
   const res = await fetch('/confirm', { method: 'POST' });
   if (!res.ok) {
     const data = await res.json();
     appendMsg('error', data.error || 'Failed to confirm.');
+  }
+}
+
+async function submitRedirect() {
+  const input = document.getElementById('prompt-input');
+  const text = input.value.trim();
+  if (!text) return;
+
+  appendMsg('user', text);
+  input.value = '';
+  disableActiveProposals();
+  phase = 'busy';
+  render();
+
+  const res = await fetch('/redirect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: text }),
+  });
+  if (!res.ok) {
+    const data = await res.json();
+    appendMsg('error', data.error || 'Failed to redirect.');
   }
 }
 
@@ -977,12 +1095,10 @@ async function submitStop() {
   // The 'stopped' SSE broadcast normally drives the UI update (see
   // handleSSE) — this is a safety net in case the SSE connection happens to
   // be down right when /stop completes, which would otherwise leave the
-  // button stuck reading "Stop" even though the server-side session really
-  // did end.
+  // button stuck on "Stop"/"Redirect" even though the server-side session
+  // really did end.
   setTimeout(() => {
-    if (document.getElementById('btn-run').classList.contains('running')) {
-      handleSSE({ type: 'stopped' });
-    }
+    if (phase !== 'idle') handleSSE({ type: 'stopped' });
   }, 1500);
 }
 

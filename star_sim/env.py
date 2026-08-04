@@ -99,21 +99,31 @@ class RobotEnv:
 # --- helpers -----------------------------------------------------------------
 
 def _plate_state(plate: Plate) -> dict[str, float]:
-    """Map each well id to its current volume in µL."""
+    """Map each *non-empty* well id to its current volume in µL.
+
+    Wells at 0 µL are omitted rather than listed — on a 96-well plate the
+    vast majority are empty for most of an experiment, and including them
+    was most of observe()'s token cost with zero informational value (an
+    LLM tool caller only cares where liquid actually is).
+    """
     state = {}
     for row in "ABCDEFGH":
         for col in range(1, plate.num_items_x + 1):
             well_id = f"{row}{col}"
-            state[well_id] = plate.get_item(well_id).tracker.get_used_volume()
+            volume = plate.get_item(well_id).tracker.get_used_volume()
+            if volume > 0:
+                state[well_id] = volume
     return state
 
 
-def _rack_state(rack: TipRack) -> dict[str, bool]:
-    """Map each tip position to True (tip present) / False (spent or missing)."""
+def _rack_state(rack: TipRack) -> dict[int, bool]:
+    """Map each tip COLUMN (not individual position) to whether it still has
+    a full set of tips. The 8-channel head only ever picks up (or has picked
+    up) a whole column at once — per-position detail is dead weight the
+    model can't act on, not useful precision.
+    """
     rows = "ABCDEFGH"[: rack.num_items_y]
     state = {}
-    for row in rows:
-        for col in range(1, rack.num_items_x + 1):
-            pos = f"{row}{col}"
-            state[pos] = rack.get_item(pos).tracker.has_tip
+    for col in range(1, rack.num_items_x + 1):
+        state[col] = all(rack.get_item(f"{row}{col}").tracker.has_tip for row in rows)
     return state

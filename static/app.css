@@ -487,6 +487,23 @@ button:hover {
   position: relative;
 }
 
+#hover-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 50;
+  max-width: 260px;
+  background: rgba(20, 20, 24, 0.92);
+  color: #eee;
+  padding: 6px 9px;
+  border-radius: 4px;
+  font-size: 0.8em;
+  font-family: monospace;
+  white-space: pre-line;
+  line-height: 1.45;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
 #canvas-container canvas {
   display: block;
   width: 100% !important;
