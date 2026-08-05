@@ -317,14 +317,18 @@ class AnthropicClient:
         self._model = model
         self._messages: list[dict] = [{"role": "user", "content": goal}]
 
-    async def complete(self) -> AgentResponse:
-        response: Message = await self._client.messages.create(
+    async def complete(self, on_delta: Callable[[str, str], None] | None = None) -> AgentResponse:
+        async with self._client.messages.stream(
             model=self._model,
             max_tokens=4096,
             system=SYSTEM,
             tools=TOOLS,
             messages=self._messages,
-        )
+        ) as stream:
+            async for text in stream.text_stream:
+                if on_delta:
+                    on_delta("text", text)
+            response: Message = await stream.get_final_message()
         self._messages.append({"role": "assistant", "content": response.content})
         text = next((b.text for b in response.content if hasattr(b, "text") and b.text.strip()), None)
         tool_uses = [
@@ -354,10 +358,49 @@ def _to_openai_tools(tools: list[dict]) -> list[dict]:
     ]
 
 
+def _model_may_segment(model: str) -> bool:
+    """Whether this model is known to sometimes only emit text OR a tool call
+    in a single completion, never both together — confirmed so far only for
+    gpt-oss. Unverified for other OpenAI-compatible models (e.g. Kimi K2) —
+    extend this only once actually observed to segment.
+    """
+    return "gpt-oss" in model
+
+
+def _thinking_extra_body(model: str, fast_mode: bool) -> dict | None:
+    """Best-effort request to skip/reduce reasoning on Kimi models that
+    support it, for when the caller wants a faster (non-thinking) turn.
+    See https://platform.kimi.ai/docs/guide/use-thinking-models — the knob
+    differs per model generation, and kimi-k2.7-code has no such knob at
+    all (thinking is mandatory there), so this intentionally returns None
+    for anything it doesn't recognize.
+    """
+    if not fast_mode:
+        return None
+    if model == "kimi-k2.6":
+        return {"thinking": {"type": "disabled", "keep": None}}
+    if model == "kimi-k3":
+        return {"reasoning_effort": "low"}
+    return None
+
+
+# Belt-and-suspenders alongside _thinking_extra_body: some models still
+# narrate step-by-step reasoning as plain visible text even with their
+# thinking/reasoning-content channel disabled via the API, especially on
+# follow-up turns — that prose lands as ordinary content, which no
+# API-level flag can suppress after the fact.
+_FAST_MODE_SYSTEM_SUFFIX = (
+    "\n\nFast mode is enabled: respond directly and concisely. Do not narrate "
+    "your reasoning process in your reply — decide, then act."
+)
+
+
 class OpenAICompatClient:
     """Agent client for any OpenAI-compatible endpoint (Groq, Ollama, etc.)."""
 
-    def __init__(self, goal: str, model: str, base_url: str, api_key: str) -> None:
+    def __init__(
+        self, goal: str, model: str, base_url: str, api_key: str, fast_mode: bool = False,
+    ) -> None:
         try:
             from openai import AsyncOpenAI
         except ImportError:
@@ -365,31 +408,84 @@ class OpenAICompatClient:
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self._model = model
         self._openai_tools = _to_openai_tools(TOOLS)
+        self._may_segment = _model_may_segment(model)
+        self._extra_body = _thinking_extra_body(model, fast_mode)
+        system_content = SYSTEM + (_FAST_MODE_SYSTEM_SUFFIX if fast_mode else "")
         self._messages: list[dict] = [
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": goal},
         ]
 
-    async def complete(self) -> AgentResponse:
-        response = await self._client.chat.completions.create(
+    async def _complete_once(self, on_delta: Callable[[str, str], None] | None = None) -> AgentResponse:
+        stream = await self._client.chat.completions.create(
             model=self._model,
             messages=self._messages,
             tools=self._openai_tools,
             tool_choice="auto",
+            stream=True,
+            extra_body=self._extra_body,
         )
-        msg = response.choices[0].message
-        msg_dict = msg.model_dump(exclude_none=True)
-        msg_dict.pop("annotations", None)  # newer openai SDK adds this; not accepted by all providers
+        content_parts: list[str] = []
+        # index -> partial tool call, merged across chunks (id/name/arguments
+        # each typically arrive split across multiple deltas)
+        tool_calls: dict[int, dict] = {}
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content_parts.append(delta.content)
+                if on_delta:
+                    on_delta("text", delta.content)
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning and on_delta:
+                on_delta("reasoning", reasoning)
+            for tc in (delta.tool_calls or []):
+                slot = tool_calls.setdefault(
+                    tc.index, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                )
+                if tc.id:
+                    slot["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        slot["function"]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        slot["function"]["arguments"] += tc.function.arguments
+
+        text = "".join(content_parts).strip() or None
+        ordered_tool_calls = [tool_calls[i] for i in sorted(tool_calls)]
+
+        msg_dict: dict = {"role": "assistant"}
+        if text is not None:
+            msg_dict["content"] = text
+        if ordered_tool_calls:
+            msg_dict["tool_calls"] = ordered_tool_calls
         self._messages.append(msg_dict)
-        text = msg.content.strip() if msg.content and msg.content.strip() else None
+
         tool_uses = []
-        for tc in (msg.tool_calls or []):
+        for tc in ordered_tool_calls:
             try:
-                args = json.loads(tc.function.arguments)
+                args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
             except json.JSONDecodeError:
                 args = {}
-            tool_uses.append((tc.id, tc.function.name, args))
+            tool_uses.append((tc["id"], tc["function"]["name"], args))
         return AgentResponse(text=text, tool_uses=tool_uses)
+
+    async def complete(self, on_delta: Callable[[str, str], None] | None = None) -> AgentResponse:
+        response = await self._complete_once(on_delta)
+        if self._may_segment and response.text and not response.tool_uses:
+            # Cheap, rare-path fix for a real correctness bug: a text-only
+            # turn would otherwise make AgentResponse.done misreport
+            # "finished the whole experiment" when the model just hasn't
+            # gotten to the tool call yet. One bounded nudge, only when this
+            # actually happens.
+            self._messages.append({
+                "role": "user",
+                "content": "Continue: call the tool for the step you just described.",
+            })
+            follow_up = await self._complete_once(on_delta)
+            return AgentResponse(text=response.text, tool_uses=follow_up.tool_uses)
+        return response
 
     def submit_tool_results(self, results: list[tuple[str, dict]]) -> None:
         for tid, r in results:
@@ -404,15 +500,19 @@ class OpenAICompatClient:
         
         
 _PROVIDER_DEFAULTS: dict[str, dict] = {
-    "anthropic": {"model": "claude-opus-4-8",     "base_url": None},
-    "groq":      {"model": "openai/gpt-oss-120b", "base_url": "https://api.groq.com/openai/v1"},
-    "ollama":    {"model": "llama3.1:8b",          "base_url": "http://localhost:11434/v1"},
+    "anthropic":  {"model": "claude-opus-4-8",     "base_url": None},
+    "groq":       {"model": "openai/gpt-oss-120b", "base_url": "https://api.groq.com/openai/v1"},
+    "ollama":     {"model": "llama3.1:8b",          "base_url": "http://localhost:11434/v1"},
+    "moonshot":   {"model": "kimi-k2.6", "base_url": "https://api.moonshot.ai/v1"},
+    "openrouter": {"model": "moonshotai/kimi-k2",   "base_url": "https://openrouter.ai/api/v1"},
 }
 
 _PROVIDER_ENV_KEYS: dict[str, str] = {
-    "anthropic":    "ANTHROPIC_API_KEY",
-    "groq":         "GROQ_API_KEY",
-    "ollama":       "",           # Ollama doesn't need a key
+    "anthropic":     "ANTHROPIC_API_KEY",
+    "groq":          "GROQ_API_KEY",
+    "ollama":        "",           # Ollama doesn't need a key
+    "moonshot":      "MOONSHOT_API_KEY",
+    "openrouter":    "OPENROUTER_API_KEY",
     "openai-compat": "OPENAI_API_KEY",
 }
 
@@ -422,6 +522,7 @@ def build_client(
     goal: str,
     model: str | None = None,
     base_url: str | None = None,
+    fast_mode: bool = False,
 ) -> AnthropicClient | OpenAICompatClient:
     defaults = _PROVIDER_DEFAULTS.get(provider, {"model": None, "base_url": None})
     resolved_model = model or defaults["model"]
@@ -444,6 +545,7 @@ def build_client(
         model=resolved_model,
         base_url=resolved_url,
         api_key=api_key,
+        fast_mode=fast_mode,
     )
 
 
@@ -498,10 +600,15 @@ class AgentSession:
         self._pending_tool_uses: list[tuple[str, str, dict]] = []  # (tool_use_id, name, args)
         # self._last_text: str | None = None
 
-    async def think(self) -> AgentResponse:
-        """Run one LLM completion. Returns the agent's text and proposed tool uses."""
+    async def think(self, on_delta: Callable[[str, str], None] | None = None) -> AgentResponse:
+        """Run one LLM completion. Returns the agent's text and proposed tool uses.
+
+        on_delta, if given, is called synchronously as ("text" | "reasoning", chunk)
+        pairs arrive from the provider's streamed response — lets a live UI show
+        progress instead of a blank wait for the full completion.
+        """
         print(f"\n[user]  Prompting model ({self._client._model})...")
-        response = await self._client.complete()
+        response = await self._client.complete(on_delta=on_delta)
         if response.text:
             print(f"\n[agent]  {response.text}")
         for _, name, args in response.tool_uses:
@@ -552,83 +659,6 @@ class AgentSession:
             self._client.submit_tool_results(skipped)
             self._pending_tool_uses = []
         self._client.inject_user_message(text)
-
-
-# ---------------------------------------------------------------------------
-# Unified agent loop
-# ---------------------------------------------------------------------------
-
-# async def run_agent(
-#     client: AnthropicClient | OpenAICompatClient,
-#     env: RobotEnv,
-#     step_delay: float = 0.0,
-#     confirm: bool = False,
-#     on_step: Callable[[str, dict, str | None, dict], Awaitable[None]] | None = None,
-# ) -> tuple[str, list[ToolCall], list[str | None]]:
-#     """Drive an agent client to execute a goal on the robot.
-
-#     Works with AnthropicClient or any OpenAICompatClient (Groq, Ollama, etc.).
-#     Returns (final_text, record, messages) where record is the list of executed
-#     tool calls and messages[i] is the agent's explanatory text (if any) from the
-#     turn that produced record[i] — the same text repeats across every tool call
-#     issued in one turn, since one explanation can cover a batch of actions.
-
-#     on_step, if given, is awaited after every executed tool call with
-#     (name, args, message, result) for that single call — e.g. for a live
-#     visualizer to fold into its own accumulated state, without re-deriving
-#     anything from the full history.
-#     """
-#     record: list[ToolCall] = []
-#     messages: list[str | None] = []
-
-#     while True:
-#         print(f"\n[user]  Prompting model ({client._model})...")
-#         response = await client.complete()
-
-#         if response.text:
-#             print(f"\n[agent]  {response.text}")
-#         if not confirm:
-#             for _, name, args in response.tool_uses:
-#                 args_str = json.dumps(args)
-#                 if len(args_str) > 120:
-#                     args_str = args_str[:117] + "..."
-#                 print(f"\n[tool]  {name}({args_str})")
-
-#         if response.done:
-#             return response.text or "", record, messages
-
-#         tool_results: list[tuple[str, dict]] = []
-#         injection: UserInjection | None = None
-
-#         for tid, name, args in response.tool_uses:
-#             if confirm and injection is None:
-#                 try:
-#                     decision = _confirm_agent(name, args)
-#                 except UserInjection as exc:
-#                     injection = exc
-#                     decision = None
-#                 if decision is None:
-#                     print(f"  [skipped] {name}")
-#                     tool_results.append((tid, {"skipped": True}))
-#                     continue
-#                 name, args = decision
-
-#             result = await _dispatch(name, args, env, step_delay, silent=confirm)
-#             record.append((name, args))
-#             messages.append(response.text)
-#             summary = json.dumps(result)
-#             if len(summary) > 300:
-#                 summary = summary[:297] + "..."
-#             print(f"  → {summary}\n")
-#             tool_results.append((tid, result))
-
-#             if on_step:
-#                 await on_step(name, args, response.text, result)
-
-#         client.submit_tool_results(tool_results)
-
-#         if injection is not None:
-#             client.inject_user_message(injection.text)
         
 
 # ---------------------------------------------------------------------------

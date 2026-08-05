@@ -155,6 +155,33 @@ body {
   white-space: pre-wrap;
 }
 
+.msg-reasoning {
+  background: #faf9f5;
+  border-left: 3px solid #c9b98a;
+  color: #8a8574;
+  font-style: italic;
+}
+
+.msg-reasoning .reasoning-header {
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+  font-style: normal;
+  font-weight: 600;
+  color: #8a8574;
+}
+
+.msg-reasoning .reasoning-body {
+  padding: 0 10px 8px 10px;
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.msg-reasoning.collapsed .reasoning-body {
+  display: none;
+}
+
 .msg-tool {
   background: #f0f4ff;
   border-left: 3px solid #6b7fc9;
@@ -453,6 +480,20 @@ button:hover {
 
 #model-picker:disabled {
   opacity: 0.6;
+}
+
+#fast-mode-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.78em;
+  color: #666;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#fast-mode-wrap input {
+  cursor: pointer;
 }
 
 #btn-run {

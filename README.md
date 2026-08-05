@@ -47,3 +47,7 @@ app.py        Uvicorn app, provides browser-based interface
 - Single-channel pipetting
 - Full documentation
 - Segmented message+tool behavior for free but weaker models such as gpt-oss (by default, only produces either a message or a tool call, not both at the same time)
+
+### Issues
+- propose_prime can sometimes suggest "0 ul/well" volumes in anticipation of future liquid movement
+- deck mouse hover info doesn't indicate cell density

@@ -654,6 +654,23 @@ function init() {
 
 // ── SSE ────────────────────────────────────────────────────────────────
 let _activeProposalEl = null;
+let _streamingMsgEl = null;   // live-updating agent bubble while text deltas arrive
+let _streamingText = '';
+
+// Live reasoning block (collapsible, like Claude's "thinking" UI) — the
+// currently-streaming box, if any. Finalized boxes are left in the DOM as
+// history and are fully self-contained (own click handler), so they don't
+// need to be tracked here once done.
+let _reasoningEl = null;
+let _reasoningBody = null;
+let _reasoningHeader = null;
+let _reasoningTimerId = null;
+let _reasoningStartTs = 0;
+
+// Generic elapsed-time ticker for the plain status line (used before the
+// first reasoning/text delta arrives, and during "Executing…").
+let _statusTimerId = null;
+let _statusStartTs = 0;
 
 function escHtml(s) {
   return String(s)
@@ -738,24 +755,137 @@ function setStatus(text) {
   }
 }
 
+function startStatusTimer(label) {
+  stopStatusTimer();
+  _statusStartTs = Date.now();
+  const tick = () => {
+    const s = Math.floor((Date.now() - _statusStartTs) / 1000);
+    setStatus(`${label} (${s}s)`);
+  };
+  tick();
+  _statusTimerId = setInterval(tick, 1000);
+}
+
+function stopStatusTimer() {
+  if (_statusTimerId) {
+    clearInterval(_statusTimerId);
+    _statusTimerId = null;
+  }
+}
+
+// Lazily creates the live "Thinking…" box for the current turn. Finalized
+// boxes are left in the conversation as collapsible history — only the
+// still-streaming one is tracked here.
+function ensureReasoningBox() {
+  if (_reasoningEl) return;
+  document.getElementById('empty-state')?.remove();
+  const conv = document.getElementById('conversation');
+  const box = document.createElement('div');
+  box.className = 'msg msg-reasoning expanded';
+  box.innerHTML =
+    `<div class="reasoning-header">▾ Thinking…</div>` +
+    `<div class="reasoning-body"></div>`;
+  const header = box.querySelector('.reasoning-header');
+  header.onclick = () => {
+    box.classList.toggle('collapsed');
+    header.textContent = header.textContent.replace(/^./, box.classList.contains('collapsed') ? '▸' : '▾');
+  };
+  conv.appendChild(box);
+  conv.scrollTop = conv.scrollHeight;
+
+  _reasoningEl = box;
+  _reasoningBody = box.querySelector('.reasoning-body');
+  _reasoningHeader = header;
+  _reasoningStartTs = Date.now();
+  const tick = () => {
+    const s = Math.floor((Date.now() - _reasoningStartTs) / 1000);
+    _reasoningHeader.textContent = `▾ Thinking… ${s}s`;
+  };
+  tick();
+  _reasoningTimerId = setInterval(tick, 1000);
+}
+
+// Stops and collapses the currently-streaming reasoning box, if any,
+// leaving it in the conversation as a clickable "Thought for Ns" summary.
+function finalizeReasoningBox() {
+  if (!_reasoningEl) return;
+  if (_reasoningTimerId) {
+    clearInterval(_reasoningTimerId);
+    _reasoningTimerId = null;
+  }
+  const s = Math.floor((Date.now() - _reasoningStartTs) / 1000);
+  _reasoningEl.classList.remove('expanded');
+  _reasoningEl.classList.add('collapsed');
+  _reasoningHeader.textContent = `▸ Thought for ${s}s`;
+  _reasoningEl = null;
+  _reasoningBody = null;
+  _reasoningHeader = null;
+}
+
+function resetStreamingState() {
+  finalizeReasoningBox();
+  _streamingMsgEl = null;
+  _streamingText = '';
+}
+
+function appendStreamingDelta(text) {
+  document.getElementById('empty-state')?.remove();
+  if (!_streamingMsgEl) {
+    const conv = document.getElementById('conversation');
+    _streamingMsgEl = document.createElement('div');
+    _streamingMsgEl.className = 'msg msg-agent';
+    _streamingMsgEl.innerHTML = `<div class="msg-label">Agent</div><span class="msg-body"></span>`;
+    conv.appendChild(_streamingMsgEl);
+  }
+  _streamingText += text;
+  _streamingMsgEl.querySelector('.msg-body').textContent = _streamingText;
+  const conv = document.getElementById('conversation');
+  conv.scrollTop = conv.scrollHeight;
+}
+
 function handleSSE(evt) {
   switch (evt.type) {
     case 'thinking':
-      setStatus('Agent is thinking…');
+      resetStreamingState();
+      startStatusTimer('Agent is thinking…');
+      break;
+    case 'agent_reasoning_delta':
+      stopStatusTimer();
+      setStatus(null);
+      ensureReasoningBox();
+      _reasoningBody.textContent += evt.text;
+      document.getElementById('conversation').scrollTop = document.getElementById('conversation').scrollHeight;
+      break;
+    case 'agent_text_delta':
+      stopStatusTimer();
+      setStatus(null);
+      finalizeReasoningBox();
+      appendStreamingDelta(evt.text);
       break;
     case 'agent_text':
+      stopStatusTimer();
+      finalizeReasoningBox();
+      if (_streamingMsgEl) {
+        _streamingMsgEl.querySelector('.msg-body').textContent = evt.text;
+        _streamingMsgEl = null;
+        _streamingText = '';
+      } else {
+        appendMsg('agent', evt.text);
+      }
       setStatus(null);
-      appendMsg('agent', evt.text);
       break;
     case 'proposals':
+      resetStreamingState();
+      stopStatusTimer();
       setStatus(null);
       appendProposals(evt.tools);
       phase = 'awaiting';
       render();
       break;
     case 'acting':
+      resetStreamingState();
       disableActiveProposals();
-      setStatus('Executing…');
+      startStatusTimer('Executing…');
       phase = 'busy';
       render();
       break;
@@ -768,6 +898,8 @@ function handleSSE(evt) {
       if (followLive) advanceToLatest();
       break;
     case 'done':
+      resetStreamingState();
+      stopStatusTimer();
       setStatus(null);
       appendMsg('agent', 'Experiment complete.');
       // The server deliberately keeps the session alive here (see _think())
@@ -777,12 +909,16 @@ function handleSSE(evt) {
       render();
       break;
     case 'stopped':
+      resetStreamingState();
+      stopStatusTimer();
       setStatus(null);
       disableActiveProposals();
       appendMsg('notice', 'Session stopped — the agent has been disconnected.');
       setRunButton(false);
       break;
     case 'error':
+      resetStreamingState();
+      stopStatusTimer();
       setStatus(null);
       appendMsg('error', evt.message);
       setRunButton(false);
@@ -903,6 +1039,7 @@ function render() {
   }
   document.getElementById('mode-badge').disabled = phase === 'busy';
   document.getElementById('model-picker').disabled = phase === 'busy';
+  document.getElementById('fast-mode-toggle').disabled = phase === 'busy';
 }
 
 function setRunButton(running) {
@@ -1064,10 +1201,11 @@ async function submitPrompt() {
   _compoundHues.clear();
 
   const provider = document.getElementById('model-picker').value;
+  const fast_mode = document.getElementById('fast-mode-toggle').checked;
   const res = await fetch('/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ goal, provider }),
+    body: JSON.stringify({ goal, provider, fast_mode }),
   });
   if (!res.ok) {
     const data = await res.json();

@@ -148,6 +148,7 @@ async def index():
 class RunRequest(BaseModel):
     goal: str
     provider: str = "groq"
+    fast_mode: bool = False
 
 
 @app.post("/run")
@@ -163,7 +164,12 @@ async def start_run(req: RunRequest):
     _state.capture = LiveCapture(_state.env, _state.geometry)
     _state.frames = _state.capture.frames
 
-    _state.session = AgentSession(env=_state.env, client=build_client(req.provider, req.goal))
+    _state.session = AgentSession(
+        env=_state.env,
+        client=build_client(req.provider, req.goal, fast_mode=req.fast_mode),
+    )
+    
+    print("\n[app] User goal: " + req.goal)
 
     _state.active_task = asyncio.create_task(_think())
     return JSONResponse({"ok": True})
@@ -273,8 +279,11 @@ async def _think() -> None:
     """Run one LLM completion and broadcast the result."""
     try:
         _state.broadcast({"type": "thinking"})
-        # time.sleep(15)
-        response = await _state.session.think()
+
+        def on_delta(kind: str, text: str) -> None:
+            _state.broadcast({"type": f"agent_{kind}_delta", "text": text})
+
+        response = await _state.session.think(on_delta=on_delta)
 
         if response.text:
             _state.broadcast({"type": "agent_text", "text": response.text})

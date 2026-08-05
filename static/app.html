@@ -56,7 +56,13 @@
         <select id="model-picker" title="Model used to drive the agent">
           <option value="anthropic">Claude Opus 4.8</option>
           <option value="groq" selected>gpt-oss-120b (Groq)</option>
+          <option value="moonshot">Kimi K2 (Moonshot)</option>
+          <option value="openrouter">Kimi K2 (OpenRouter)</option>
         </select>
+        <label id="fast-mode-wrap"
+          title="Ask the model to skip/reduce extended thinking, if it supports that (currently Kimi K2.6 and K3 only).">
+          <input type="checkbox" id="fast-mode-toggle"> Fast mode
+        </label>
         <button id="btn-run">&#9654; Run simulation</button>
       </div>
     </div>
