@@ -27,6 +27,8 @@ python app.py
 
 ## Layout
 
+**OUTDATED**
+
 ```
 star_sim/
   deck.py         build_starlet_deck() -> deck + named resource handles
@@ -46,8 +48,15 @@ app.py        Uvicorn app, provides browser-based interface
 - Dynamic and easily configurable deck layouts (potential interop with existing Hamilton software tools?)
 - Single-channel pipetting
 - Full documentation
-- Segmented message+tool behavior for free but weaker models such as gpt-oss (by default, only produces either a message or a tool call, not both at the same time)
+- Advanced LLM model picker and configuration
+- Long-term planning
+- Multi-agent experimental validation
+- Facile deployment onto in-unit Hamilton PC
 
 ### Issues
 - propose_prime can sometimes suggest "0 ul/well" volumes in anticipation of future liquid movement
 - deck mouse hover info doesn't indicate cell density
+- combining compounds results in a very white coloring scheme due to the math
+- putting something into media causes the media tag to disappear..? including even media+media
+- agent.py contains terminal-based deadcode
+- weaker models such as gpt-oss:120b may produce tool calls with zero explanation
