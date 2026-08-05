@@ -21,7 +21,7 @@ from anthropic.types import Message
 
 from star_sim.env import RobotEnv
 from star_sim.plate_map import Compound, WellContents, mix_contents
-from protocols.primitives import column_transfer, mix_column, multi_dispense, serial_transfer
+from star_sim.primitives import column_transfer, mix_column, multi_dispense, serial_transfer
 
 # ---------------------------------------------------------------------------
 # Tool schemas (passed to the Claude API on every request)
