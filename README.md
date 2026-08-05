@@ -47,4 +47,3 @@ app.py        Uvicorn app, provides browser-based interface
 - Single-channel pipetting
 - Full documentation
 - Segmented message+tool behavior for free but weaker models such as gpt-oss (by default, only produces either a message or a tool call, not both at the same time)
-- Post-experiment redirection ("wait, you forgot this last step")

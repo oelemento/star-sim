@@ -617,6 +617,9 @@ function init() {
   document.getElementById('prompt-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitPrompt(); }
   });
+  document.getElementById('prompt-input').addEventListener('input', () => {
+    if (phase === 'idle-done') render();
+  });
 
   applyModeBadge(INITIAL_USE_HARDWARE);
   document.getElementById('mode-badge').addEventListener('click', toggleHardware);
@@ -767,7 +770,11 @@ function handleSSE(evt) {
     case 'done':
       setStatus(null);
       appendMsg('agent', 'Experiment complete.');
-      setRunButton(false);
+      // The server deliberately keeps the session alive here (see _think())
+      // so a follow-up can redirect it — distinct from plain 'idle', which
+      // covers 'stopped'/'error' where the session really is gone.
+      phase = 'idle-done';
+      render();
       break;
     case 'stopped':
       setStatus(null);
@@ -858,29 +865,42 @@ function replayMock(events = MOCK_EVENTS, delayMs = 2000) {
 // dirty deck. Cleared back to false by resetSimulation().
 let sessionDirty = false;
 
-// 'idle'     — nothing running; button is Run or Reset depending on sessionDirty.
-// 'busy'     — agent is thinking or executing tools; no user input accepted.
-// 'awaiting' — tools were proposed but not yet confirmed; the prompt box is
-//              open again so the user can redirect instead of just confirming.
+// 'idle'      — nothing running (or the session really is gone, e.g. after
+//               stopped/error); button is Run or Reset depending on sessionDirty.
+// 'busy'      — agent is thinking or executing tools; no user input accepted.
+// 'awaiting'  — tools were proposed but not yet confirmed; the prompt box is
+//               open again so the user can redirect instead of just confirming.
+// 'idle-done' — the experiment finished, but the server deliberately kept the
+//               session alive (see the 'done' handler) so it can still be
+//               redirected instead of only reset.
 let phase = 'idle';
 
 function render() {
   const btn = document.getElementById('btn-run');
+  const input = document.getElementById('prompt-input');
   btn.classList.toggle('running', phase === 'busy');
   if (phase === 'busy') {
     btn.textContent = '■ Stop';
   } else if (phase === 'awaiting') {
     btn.textContent = '↻ Redirect';
+  } else if (phase === 'idle-done') {
+    // Relabels live as the user types (see the 'input' listener in init()):
+    // typing something means "continue this experiment", leaving it blank
+    // and clicking means "discard it and start clean".
+    btn.textContent = input.value.trim() ? '↻ Continue' : '↺ Reset simulation';
   } else if (sessionDirty) {
     btn.textContent = '↺ Reset simulation';
   } else {
     btn.textContent = '▶ Run simulation';
   }
-  const input = document.getElementById('prompt-input');
   input.disabled = phase === 'busy';
-  input.placeholder = phase === 'awaiting'
-    ? "Don't like the proposed actions? Describe what to do instead, or confirm below."
-    : "Describe the experiment in plain language, e.g. Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates for each condition, including controls.";
+  if (phase === 'awaiting') {
+    input.placeholder = "Don't like the proposed actions? Describe what to do instead, or confirm below.";
+  } else if (phase === 'idle-done') {
+    input.placeholder = 'Forgot a step? Describe what to do next, or leave blank and click Reset.';
+  } else {
+    input.placeholder = 'Describe the experiment in plain language, e.g. Test Drug A and Drug B individually, then all pairwise combinations, with 4 replicates for each condition, including controls.';
+  }
   document.getElementById('mode-badge').disabled = phase === 'busy';
   document.getElementById('model-picker').disabled = phase === 'busy';
 }
@@ -1020,6 +1040,11 @@ async function submitPrompt() {
 
   if (phase === 'busy') { await submitStop(); return; }
   if (phase === 'awaiting') { await submitRedirect(); return; }
+  if (phase === 'idle-done') {
+    if (input.value.trim()) await submitRedirect();
+    else await resetSimulation();
+    return;
+  }
   if (sessionDirty) { await resetSimulation(); return; }
 
   const goal = input.value.trim();

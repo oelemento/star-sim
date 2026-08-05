@@ -57,6 +57,13 @@ class _State:
         # SSE subscribers: one asyncio.Queue per open browser tab
         self._queues: list[asyncio.Queue] = []
 
+    @property
+    def busy(self) -> bool:
+        """True only while a _think()/_act_then_think() task is actually
+        running — unlike `session is not None`, which stays true for an idle,
+        finished-but-redirectable session too."""
+        return self.active_task is not None and not self.active_task.done()
+
     def broadcast(self, event: dict) -> None:
         payload = json.dumps(event)
         for q in self._queues:
@@ -180,7 +187,7 @@ async def set_mode(req: ModeRequest):
     """Switch the backend used by the *next* /run. Connects (and immediately
     disconnects) a real STAR to verify hardware is reachable before committing —
     /run only ever sees a mode that's already been proven to work."""
-    if _state.session is not None:
+    if _state.busy:
         return JSONResponse({"error": "cannot switch mode while a run is active"}, status_code=400)
 
     if req.use_hardware:
@@ -273,7 +280,12 @@ async def _think() -> None:
             _state.broadcast({"type": "agent_text", "text": response.text})
 
         if response.done:
-            await _state.teardown()
+            # Deliberately not tearing down: session/env/capture stay alive so
+            # the user can redirect a *finished* experiment ("wait, you forgot
+            # this step") the same way they can redirect a proposed one — via
+            # /redirect, which already handles "nothing pending to decline"
+            # gracefully. Only an explicit /stop, /reset, or starting a new
+            # /run actually ends this session from here.
             _state.broadcast({"type": "done"})
         else:
             proposals = [
