@@ -21,7 +21,8 @@ from anthropic.types import Message
 
 from star_sim.env import RobotEnv
 from star_sim.plate_map import Compound, WellContents, mix_contents
-from star_sim.primitives import column_transfer, mix_column, multi_dispense, serial_transfer
+from star_sim.channels import ROWS, describe, parse_selector
+from star_sim.primitives import mix, transfer
 
 # ---------------------------------------------------------------------------
 # Tool schemas (passed to the Claude API on every request)
@@ -31,91 +32,76 @@ TOOLS: list[dict] = [
     {
         "name": "observe",
         "description": (
-            "Return the current deck state: volume (µL) in every well of every plate, "
-            "tip availability, remaining full tip columns, and the plate map recording "
-            "compound/cell contents noted so far."
+            "Return the current deck state: volume (µL) in every non-empty well of "
+            "every plate, which tip-rack rows still hold a tip in each column, the "
+            "total tips remaining, and the plate map recording compound/cell "
+            "contents noted so far."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "column_transfer",
+        "name": "transfer",
         "description": (
-            "Aspirate `volume` µL from all 8 wells of src_col on src_plate and dispense "
-            "into dst_col on dst_plate. Consumes one fresh tip column."
+            "Move liquid from source wells to destination wells.\n"
+            "src/dst are well selectors: a single well ('B3'), a range ('A1:H1'), or "
+            "an explicit list (['A1','C4']). A range covers the block between its "
+            "corners, walked down each column then across — 'A1:H1' is all 8 rows of "
+            "column 1; 'A1:H6' is columns 1-6.\n"
+            "Equal-length selections pair up one-to-one. A smaller source repeats "
+            "across the destinations, so one source column can fill several "
+            "destination columns, and one source well can fill several wells in its "
+            "own row.\n"
+            "A transfer must stay within a row (A1->A5 is fine, A1->B5 is not), "
+            "because each of the 8 channels is fixed to its own row."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "src_plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "src_col": {"type": "integer", "minimum": 1, "maximum": 12, "description": "1-indexed column"},
+                "src": {"type": "string", "description": "Source well selector, e.g. 'A1:H1' or 'B3'."},
                 "dst_plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "dst_col": {"type": "integer", "minimum": 1, "maximum": 12},
-                "volume": {"type": "number", "minimum": 1, "maximum": 1000, "description": "µL per channel"},
+                "dst": {"type": "string", "description": "Destination well selector."},
+                "volume": {
+                    "type": "number",
+                    "description": "µL per destination well.",
+                },
+                "tips": {
+                    "type": "string",
+                    "enum": ["new", "reuse"],
+                    "description": (
+                        "'new' (default) takes fresh tips for every column of "
+                        "destinations — always safe. 'reuse' keeps one set for the "
+                        "whole call: use it for a dilution chain, or when "
+                        "distributing one clean reagent into many wells. Reusing "
+                        "tips across unrelated wells risks carryover and will "
+                        "return a warning."
+                    ),
+                },
                 "transfer_cells": {
                     "type": "boolean",
-                    "description": "Set true only after mix_column has resuspended cells in the source wells.",
+                    "description": "Set true only after mix has resuspended cells in the source wells.",
                 },
             },
-            "required": ["src_plate", "src_col", "dst_plate", "dst_col", "volume"],
+            "required": ["src_plate", "src", "dst_plate", "dst", "volume"],
         },
     },
     {
-        "name": "multi_dispense",
+        "name": "mix",
         "description": (
-            "Aspirate `volume` µL from src_col on src_plate and dispense into each column "
-            "in dst_cols on dst_plate, re-aspirating before each destination. "
-            "Reuses one tip set throughout (safe: tips only ever touch one source). "
-            "Prefer this over multiple column_transfer calls when distributing one source "
-            "to several destinations — it uses one tip column instead of N."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "src_plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "src_col": {"type": "integer", "minimum": 1, "maximum": 12},
-                "dst_plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "dst_cols": {
-                    "type": "array",
-                    "items": {"type": "integer", "minimum": 1, "maximum": 12},
-                    "description": "Columns to fill, e.g. [2,3,4,5,6]",
-                },
-                "volume": {"type": "number", "minimum": 1, "maximum": 1000, "description": "µL per channel per destination"},
-                "transfer_cells": {"type": "boolean"},
-            },
-            "required": ["src_plate", "src_col", "dst_plate", "dst_cols", "volume"],
-        },
-    },
-    {
-        "name": "mix_column",
-        "description": "Mix a column in place by repeatedly aspirating and re-dispensing into the same wells.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "col": {"type": "integer", "minimum": 1, "maximum": 12},
-                "volume": {"type": "number", "minimum": 1, "maximum": 1000},
-                "repetitions": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
-            },
-            "required": ["plate", "col", "volume"],
-        },
-    },
-    {
-        "name": "serial_transfer",
-        "description": (
-            "Transfer `volume` µL from column k to column k+1 for k in [start_col, end_col). "
-            "end_col receives the final dispense. One tip set is reused for the whole sequence "
-            "(safe: tips always move in the direction of increasing dilution)."
+            "Aspirate and re-dispense in place to resuspend settled cells or "
+            "homogenise a well after a transfer. Moves no liquid between wells and "
+            "leaves concentrations unchanged. Takes the same well selectors as transfer."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "plate": {"type": "string", "enum": ["source_plate", "dest_plate"]},
-                "start_col": {"type": "integer", "minimum": 1, "maximum": 12},
-                "end_col": {"type": "integer", "minimum": 2, "maximum": 12},
-                "volume": {"type": "number", "minimum": 1, "maximum": 1000},
-                "transfer_cells": {"type": "boolean"},
+                "wells": {"type": "string", "description": "Well selector, e.g. 'A1:H1'."},
+                "volume": {"type": "number", "description": "µL drawn up per cycle."},
+                "repetitions": {"type": "integer", "minimum": 1, "description": "Default 3."},
+                "tips": {"type": "string", "enum": ["new", "reuse"]},
             },
-            "required": ["plate", "start_col", "end_col", "volume"],
+            "required": ["plate", "wells", "volume"],
         },
     },
     {
@@ -132,7 +118,7 @@ TOOLS: list[dict] = [
             "properties": {
                 "reagents": {
                     "type": "array",
-                    "description": "One entry per column to initialise, on any plate.",
+                    "description": "One entry per group of wells to initialise, on any plate.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -141,7 +127,17 @@ TOOLS: list[dict] = [
                                 "enum": ["source_plate", "dest_plate"],
                                 "description": "Which plate to load (default: source_plate)",
                             },
-                            "col": {"type": "integer", "minimum": 1, "maximum": 12},
+                            "col": {
+                                "type": "integer", "minimum": 1, "maximum": 12,
+                                "description": "Fill all 8 wells of this column. Use `wells` instead for anything narrower.",
+                            },
+                            "wells": {
+                                "type": "string",
+                                "description": (
+                                    "Well selector ('A1', 'A1:H1', 'A1:D3') naming exactly "
+                                    "which wells to load. Give either this or `col`."
+                                ),
+                            },
                             "compound": {"type": "string", "description": "e.g. 'dye', 'buffer', 'DMSO'"},
                             "concentration_um": {"type": "number", "description": "µM; omit for buffer/media"},
                             "cells": {"type": "string", "description": "Cell line name, e.g. 'HeLa'"},
@@ -149,7 +145,7 @@ TOOLS: list[dict] = [
                             "volume_ul": {"type": "number", "description": "µL per well"},
                             "notes": {"type": "string"},
                         },
-                        "required": ["col", "volume_ul"],
+                        "required": ["volume_ul"],
                     },
                 },
             },
@@ -172,12 +168,23 @@ DECK LAYOUT
                 Holds reagent stocks (compounds, buffer, media).
   dest_plate    96-well deep-well plate, 12 cols x 8 rows (A-H). 2000 µL max per well.
                 Receives the experiment.
-  tip_rack      96 Hamilton 1000 µL filtered tips in 12 columns (A-H x 1-12).
-                The 8-channel head picks up one full column (8 tips) per operation.
-                Each column is single-use — once dropped, it cannot be reused.
+  tip_rack      96 Hamilton 1000 µL filtered tips, 8 rows (A-H) x 12 columns.
+                Tips are consumed individually: a one-well transfer costs one tip,
+                a full-column transfer costs eight. Used tips are discarded and
+                cannot be picked up again.
 
 OPERATION MODEL
-  Every liquid-handling tool acts on all 8 wells of a column simultaneously.
+  You address wells directly, using selectors: a single well ('B3'), a range
+  ('A1:H1' = all 8 rows of column 1; 'A1:H6' = columns 1-6), or a list
+  (['A1','C4']). Ranges walk down each column, then across to the next.
+
+  The head has 8 channels on a fixed pitch, which constrains what one movement
+  can do:
+    - Channel N is fixed to row N, so a transfer stays within its row.
+      A1 -> A5 is fine; A1 -> B5 is not. Route between rows via an intermediate well.
+    - One movement addresses one column. A transfer spanning several columns is
+      carried out as one movement per column, in the order the selector lists them.
+
   Volumes are in microlitres (µL). Concentrations are in micromolar (µM).
 
 RULES
@@ -188,13 +195,18 @@ RULES
      are highly tractable to a human operator.
   4. Compound concentrations are tracked automatically via mass balance through every
      transfer and presented by observe().
-  5. Cells stay where they are seeded. To move cells, first call mix_column to resuspend
+  5. Cells stay where they are seeded. To move cells, first call mix to resuspend
      them, then pass transfer_cells=true to the transfer call.
   6. Never aspirate more than a well contains; never exceed the well max volume.
      If a tool returns {"error": ...}, read the message and adjust before retrying or quitting.
-  7. Plan tip consumption up front. The rack has 12 columns (96 tips total).
-     Use multi_dispense (not repeated column_transfer) when one source feeds many
-     destinations. Use serial_transfer (not repeated column_transfer) for dilution chains.
+  7. Plan tip consumption up front — 96 tips total. Prefer one wide transfer over
+     many narrow ones: a single call with a multi-column destination reuses the
+     channels efficiently, and tips='reuse' spends one set of tips for the whole
+     call instead of one set per column. Two idioms worth knowing:
+       - distribute one reagent:  src 'A1:H1', dst 'A2:H6', tips 'reuse'
+       - serial dilution chain:   src 'A1:H5', dst 'A2:H6', tips 'reuse'
+         (each step aspirates from the well it just filled, so there is no carryover)
+     Use tips='new' whenever unrelated wells must not cross-contaminate.
   8. When done, summarise the completed experiment and the resulting plate layout.
 """
 
@@ -275,21 +287,27 @@ SERIAL_DILUTION_PRIME: dict = {
 #   dest_plate col 6: 200 µL, 6.25 µM dye  (only received, never gave)
 SERIAL_DILUTION_SCRIPT: list[ToolCall] = [
     ("propose_prime", SERIAL_DILUTION_PRIME),
-    # 1. Pre-fill dest cols 2-6 with 100 µL buffer (one tip column reused)
-    ("multi_dispense", {
-        "src_plate": "source_plate", "src_col": 2,
-        "dst_plate": "dest_plate", "dst_cols": [2, 3, 4, 5, 6],
-        "volume": 100,
+    # 1. Pre-fill dest cols 2-6 with 100 µL buffer. The source column repeats
+    #    across the five destination columns; one set of tips serves all of them
+    #    because the diluent is clean.
+    ("transfer", {
+        "src_plate": "source_plate", "src": "A2:H2",
+        "dst_plate": "dest_plate", "dst": "A2:H6",
+        "volume": 100, "tips": "reuse",
     }),
     # 2. Seed dest col 1 with 200 µL dye at 200 µM
-    ("column_transfer", {
-        "src_plate": "source_plate", "src_col": 1,
-        "dst_plate": "dest_plate", "dst_col": 1,
+    ("transfer", {
+        "src_plate": "source_plate", "src": "A1:H1",
+        "dst_plate": "dest_plate", "dst": "A1:H1",
         "volume": 200,
     }),
-    # 3. Serial 1→2→…→6: concentrations computed automatically
-    ("serial_transfer", {
-        "plate": "dest_plate", "start_col": 1, "end_col": 6, "volume": 100,
+    # 3. Serial 1→2→…→6: five column-to-column steps in one call, concentrations
+    #    computed automatically. Safe to reuse tips — each step aspirates from the
+    #    well the previous step just filled.
+    ("transfer", {
+        "src_plate": "dest_plate", "src": "A1:H5",
+        "dst_plate": "dest_plate", "dst": "A2:H6",
+        "volume": 100, "tips": "reuse",
     }),
 ]
 
@@ -678,7 +696,10 @@ def preview_tool(name: str, args: dict) -> str:
             lines = []
             for r in args.get("reagents", []):
                 plate = r.get("plate", "source_plate")
-                col = r.get("col", "?")
+                try:
+                    where = describe(_prime_wells(r))
+                except Exception:
+                    where = "?"
                 vol = r.get("volume_ul", "?")
                 parts: list[str] = []
                 if "compound" in r:
@@ -689,32 +710,27 @@ def preview_tool(name: str, args: dict) -> str:
                     parts.append(f"{r['cells']}{density}")
                 if not parts:
                     parts.append("media/buffer")
-                lines.append(f"{plate} col {col}: {', '.join(parts)}  ({vol} µL/well)")
+                lines.append(f"{plate} {where}: {', '.join(parts)}  ({vol} µL/well)")
             return "\n".join(lines)
 
-        case "column_transfer":
+        case "transfer":
             tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
-            return (
-                f"{args['src_plate']} col {args['src_col']} → "
-                f"{args['dst_plate']} col {args['dst_col']}  ({args['volume']} µL){tc}"
-            )
+            tips = args.get("tips", "new")
+            reuse = "  [reusing tips]" if tips == "reuse" else ""
+            try:
+                srcs, dsts = parse_selector(args["src"]), parse_selector(args["dst"])
+                where = f"{args['src_plate']} {describe(srcs)} \u2192 {args['dst_plate']} {describe(dsts)}"
+            except Exception:
+                where = f"{args['src_plate']} {args['src']} \u2192 {args['dst_plate']} {args['dst']}"
+            return f"{where}  ({args['volume']} \u00b5L){reuse}{tc}"
 
-        case "multi_dispense":
-            cols = args.get("dst_cols", [])
-            tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
-            return (
-                f"{args['src_plate']} col {args['src_col']} → "
-                f"{args['dst_plate']} cols {cols}  ({args['volume']} µL each){tc}"
-            )
-
-        case "serial_transfer":
-            cols = " → ".join(str(c) for c in range(args["start_col"], args["end_col"] + 1))
-            tc = "  [transfer_cells]" if args.get("transfer_cells") else ""
-            return f"{args['plate']} cols {cols}  ({args['volume']} µL steps){tc}"
-
-        case "mix_column":
+        case "mix":
             reps = args.get("repetitions", 3)
-            return f"{args['plate']} col {args['col']}  ({args['volume']} µL × {reps} reps)"
+            try:
+                where = describe(parse_selector(args["wells"]))
+            except Exception:
+                where = str(args.get("wells"))
+            return f"{args['plate']} {where}  ({args['volume']} \u00b5L \u00d7 {reps} reps)"
 
         case "observe":
             return "read current deck state"
@@ -780,19 +796,67 @@ def _confirm_agent(name: str, args: dict) -> tuple[str, dict] | None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _col_vols(env: RobotEnv, plate_name: str, col: int) -> dict[str, float]:
-    """Return {row: volume_ul} for all 8 rows of a column, reading the PLR tracker."""
-    plate = getattr(env.layout, plate_name)
-    return {row: plate.get_item(f"{row}{col}").tracker.get_used_volume() for row in "ABCDEFGH"}
+def _well_vol(env: RobotEnv, plate_name: str, well: str) -> float:
+    """Current volume in one well, per PyLabRobot's tracker."""
+    return getattr(env.layout, plate_name).get_item(well).tracker.get_used_volume()
 
 
-def _clear_emptied_col(env: RobotEnv, plate_name: str, col: int) -> None:
-    """Wipe plate_map entries for wells in a column that PLR reports as empty after aspiration."""
-    plate = getattr(env.layout, plate_name)
-    for row in "ABCDEFGH":
-        well_id = f"{row}{col}"
-        if plate.get_item(well_id).tracker.get_used_volume() <= 0:
-            env.plate_map.set_well(plate_name, well_id, WellContents())
+def _clear_emptied(env: RobotEnv, plate_name: str, wells: list[str]) -> None:
+    """Wipe plate_map entries for wells PyLabRobot now reports as empty."""
+    for well in wells:
+        if _well_vol(env, plate_name, well) <= 0:
+            env.plate_map.set_well(plate_name, well, WellContents())
+
+
+def _track_contents(env: RobotEnv, transfer_cells: bool) -> Callable[[str, dict], None]:
+    """Build a movement listener that keeps the plate map in step with the liquid.
+
+    Movements now carry their own wells and volumes, so one listener covers every
+    transfer shape — including a dilution chain, where each step aspirates from a
+    well an earlier step filled. The aspirate handler snapshots what the tips took
+    up, keyed by channel; the dispense handler mixes that into the destination.
+    Reading the source at aspirate time is what makes chains correct: no shadow
+    copy of the plate is needed, because the plate map is already up to date by
+    the time the next step draws from it.
+
+    Volumes come from the tracker *after* the movement, so the pre-dispense volume
+    is recovered by subtracting what was just added.
+    """
+    held: dict[int, tuple[WellContents | None, float]] = {}
+
+    def on_movement(kind: str, info: dict) -> None:
+        if info.get("mixing"):
+            return  # in-place: same liquid back in the same well, nothing changes
+        wells = info.get("wells") or []
+        volumes = info.get("volumes") or []
+        channels = info.get("channels") or []
+        plate = info.get("plate")
+        if kind == "aspirate":
+            for well, vol, chan in zip(wells, volumes, channels):
+                held[chan] = (env.plate_map.get_well(plate, well), vol)
+            _clear_emptied(env, plate, list(wells))
+        elif kind == "dispense":
+            for well, vol, chan in zip(wells, volumes, channels):
+                src_contents, _ = held.get(chan, (None, 0.0))
+                dst_pre = max(_well_vol(env, plate, well) - vol, 0.0)
+                env.plate_map.set_well(plate, well, mix_contents(
+                    src_contents, vol,
+                    env.plate_map.get_well(plate, well), dst_pre,
+                    transfer_cells=transfer_cells,
+                ))
+
+    return on_movement
+
+
+def _prime_wells(entry: dict) -> list[str]:
+    """Which wells one propose_prime entry refers to — `wells` selector, or all of `col`."""
+    if entry.get("wells"):
+        return parse_selector(entry["wells"])
+    if entry.get("col"):
+        return [f"{row}{entry['col']}" for row in ROWS]
+    raise ValueError(
+        "Each reagent entry needs either 'wells' (e.g. 'A1:H1') or 'col'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +882,8 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                             if "cells" in r:
                                 density = f" @ {r['cell_density_per_ml']:.0f}/mL" if "cell_density_per_ml" in r else ""
                                 parts.append(f"{r['cells']}{density}")
-                            print(f"  col {r['col']:2d}: {', '.join(parts) or 'media'}  ({r['volume_ul']} µL/well)")
+                            where = describe(_prime_wells(r))
+                            print(f"  {where:>20}: {', '.join(parts) or 'media'}  ({r['volume_ul']} µL/well)")
                     input("\n  Prepare the above plates, then press Enter to continue...")
                 elif not silent:
                     print("\n  Simulation continuing (priming set by default)")
@@ -828,9 +893,10 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                 for plate_name, plate_reagents in by_plate.items():
                     plate_obj = getattr(env.layout, plate_name)
                     for r in plate_reagents:
+                        wells = _prime_wells(r)
                         # set volumes
-                        for row in "ABCDEFGH":
-                            plate_obj.get_item(f"{row}{r['col']}").tracker.set_volume(r["volume_ul"])
+                        for well in wells:
+                            plate_obj.get_item(well).tracker.set_volume(r["volume_ul"])
                         # set compounds — identity is recorded whenever a name was given,
                         # independent of concentration: DMSO/media are routinely primed with
                         # no concentration_um at all (the tool schema says as much), and that
@@ -842,120 +908,46 @@ async def _dispatch(name: str, args: dict, env: RobotEnv, step_delay: float, sil
                             if "compound" in r else []
                         )
                         # set cells
-                        env.plate_map.set_column(
-                            plate_name, r["col"],
-                            WellContents(
-                                compounds=compounds,
-                                cells=r.get("cells"),
-                                cell_density_per_ml=r.get("cell_density_per_ml"),
-                                notes=r.get("notes", ""),
-                            ),
-                        )
+                        for well in wells:
+                            env.plate_map.set_well(
+                                plate_name, well,
+                                WellContents(
+                                    compounds=list(compounds),
+                                    cells=r.get("cells"),
+                                    cell_density_per_ml=r.get("cell_density_per_ml"),
+                                    notes=r.get("notes", ""),
+                                ),
+                            )
                 return {"ok": True, "loaded": len(reagents), "hardware": env._use_hardware}
 
             case "observe":
                 return env.observe()
 
-            case "column_transfer":
-                src_plate, src_col = args["src_plate"], args["src_col"]
-                dst_plate, dst_col = args["dst_plate"], args["dst_col"]
-                volume = args["volume"]
+            case "transfer":
+                src_plate, dst_plate = args["src_plate"], args["dst_plate"]
                 tc = args.get("transfer_cells", False)
-                dst_pre = _col_vols(env, dst_plate, dst_col)
-
-                def on_movement(kind: str, info: dict) -> None:
-                    if kind != "dispense" or info.get("plate") != dst_plate or info.get("col") != dst_col:
-                        return
-                    for row in "ABCDEFGH":
-                        env.plate_map.set_well(dst_plate, f"{row}{dst_col}", mix_contents(
-                            env.plate_map.get_well(src_plate, f"{row}{src_col}"), volume,
-                            env.plate_map.get_well(dst_plate, f"{row}{dst_col}"), dst_pre[row],
-                            transfer_cells=tc,
-                        ))
-
-                env.add_movement_listener(on_movement)
+                listener = _track_contents(env, tc)
+                env.add_movement_listener(listener)
                 try:
-                    await column_transfer(env, src_plate, src_col, dst_plate, dst_col, volume, step_delay=step_delay)
+                    return await transfer(
+                        env, src_plate, args["src"], dst_plate, args["dst"],
+                        args["volume"],
+                        tips=args.get("tips", "new"),
+                        transfer_cells=tc,
+                        step_delay=step_delay,
+                    )
                 finally:
-                    env.remove_movement_listener(on_movement)
-                _clear_emptied_col(env, src_plate, src_col)
-                return {"ok": True}
+                    env.remove_movement_listener(listener)
 
-            case "multi_dispense":
-                src_plate, src_col = args["src_plate"], args["src_col"]
-                dst_plate, dst_cols = args["dst_plate"], args["dst_cols"]
-                volume = args["volume"]
-                tc = args.get("transfer_cells", False)
-                dst_pre = {col: _col_vols(env, dst_plate, col) for col in dst_cols}
-
-                def on_movement(kind: str, info: dict) -> None:
-                    col = info.get("col")
-                    if kind != "dispense" or info.get("plate") != dst_plate or col not in dst_pre:
-                        return
-                    for row in "ABCDEFGH":
-                        env.plate_map.set_well(dst_plate, f"{row}{col}", mix_contents(
-                            env.plate_map.get_well(src_plate, f"{row}{src_col}"), volume,
-                            env.plate_map.get_well(dst_plate, f"{row}{col}"), dst_pre[col][row],
-                            transfer_cells=tc,
-                        ))
-
-                env.add_movement_listener(on_movement)
-                try:
-                    await multi_dispense(env, src_plate, src_col, dst_plate, dst_cols, volume, step_delay=step_delay)
-                finally:
-                    env.remove_movement_listener(on_movement)
-                _clear_emptied_col(env, src_plate, src_col)
-                return {"ok": True}
-
-            case "mix_column":
-                await mix_column(
-                    env, args["plate"], args["col"], args["volume"],
-                    repetitions=args.get("repetitions", 3), step_delay=step_delay,
+            case "mix":
+                # In-place, so concentrations and cell density are unchanged and
+                # no content listener is needed.
+                return await mix(
+                    env, args["plate"], args["wells"], args["volume"],
+                    repetitions=args.get("repetitions", 3),
+                    tips=args.get("tips", "new"),
+                    step_delay=step_delay,
                 )
-                return {"ok": True}  # in-place: concentrations and cell density unchanged
-
-            case "serial_transfer":
-                plate_name = args["plate"]
-                start_col, end_col = args["start_col"], args["end_col"]
-                volume = args["volume"]
-                tc = args.get("transfer_cells", False)
-
-                local_vols = {
-                    (row, col): _col_vols(env, plate_name, col)[row]
-                    for col in range(start_col, end_col + 1)
-                    for row in "ABCDEFGH"
-                }
-                local: dict[tuple, WellContents | None] = {
-                    k: env.plate_map.get_well(plate_name, f"{k[0]}{k[1]}") for k in local_vols
-                }
-
-                def on_movement(kind: str, info: dict) -> None:
-                    if kind != "dispense" or info.get("plate") != plate_name:
-                        return
-                    dst_col = info.get("col")
-                    src_col = dst_col - 1
-                    if not (start_col <= src_col < end_col):
-                        return
-                    for row in "ABCDEFGH":
-                        src_k, dst_k = (row, src_col), (row, dst_col)
-                        local[dst_k] = mix_contents(
-                            local[src_k], volume, local[dst_k], local_vols[dst_k],
-                            transfer_cells=tc,
-                        )
-                        local_vols[src_k] -= volume
-                        local_vols[dst_k] += volume
-                        well_id = f"{row}{dst_col}"
-                        if local_vols[dst_k] <= 0:
-                            env.plate_map.set_well(plate_name, well_id, WellContents())
-                        else:
-                            env.plate_map.set_well(plate_name, well_id, local[dst_k])
-
-                env.add_movement_listener(on_movement)
-                try:
-                    await serial_transfer(env, plate_name, start_col, end_col, volume, step_delay=step_delay)
-                finally:
-                    env.remove_movement_listener(on_movement)
-                return {"ok": True}
 
             case _:
                 return {"error": f"unknown tool '{name}'"}

@@ -157,31 +157,39 @@ def geometry(env: RobotEnv) -> dict:
     }
 
 
-def _col_center(plate_name: str, col: int, geometry: dict) -> dict | None:
-    col_str = str(col)
-    pw = [w for w in geometry["wells"]
-          if w["plate"] == plate_name and w["id"][1:] == col_str]
-    if not pw:
+def _center_of(items: list[dict], plate_name: str | None) -> dict | None:
+    """Mean centre of a set of geometry entries, as the head's target position.
+
+    The channels themselves are placed per-row by the viewer (see alignChannels in
+    app.js); this only needs to say where the head as a whole travels to.
+    """
+    if not items:
         return None
     return {
-        "x": sum(w["x"] + w["w"] / 2 for w in pw) / len(pw),
-        "y": sum(w["y"] + w["h"] / 2 for w in pw) / len(pw),
+        "x": sum(i["x"] + i["w"] / 2 for i in items) / len(items),
+        "y": sum(i["y"] + i["h"] / 2 for i in items) / len(items),
         "plate": plate_name,
     }
 
 
-def _tip_col_center(rack_name: str, col: int, geometry: dict) -> dict | None:
-    col_str = str(col)
-    ps = [s for s in geometry["tip_spots"]
-          if s["rack"] == rack_name and s["id"][1:] == col_str]
-    if not ps:
-        return None
-    return {
-        "x": sum(s["x"] + s["w"] / 2 for s in ps) / len(ps),
-        "y": sum(s["y"] + s["h"] / 2 for s in ps) / len(ps),
-        "plate": None,
-    }
-    
+def _wells_center(plate_name: str, well_ids: list[str], geometry: dict) -> dict | None:
+    wanted = set(well_ids)
+    return _center_of(
+        [w for w in geometry["wells"]
+         if w["plate"] == plate_name and w["id"] in wanted],
+        plate_name,
+    )
+
+
+def _tip_spots_center(rack_name: str, spot_ids: list[str], geometry: dict) -> dict | None:
+    wanted = set(spot_ids)
+    return _center_of(
+        [s for s in geometry["tip_spots"]
+         if s["rack"] == rack_name and s["id"] in wanted],
+        None,
+    )
+
+
 
 # Whether tips become visible (True), get discarded (False), or are unaffected
 # (omitted) on the pipette after each kind of recorded movement.
@@ -223,22 +231,22 @@ def _snapshot(env: RobotEnv, tip_rack_names: list[str]) -> dict:
 
 def _movement_target(kind: str, info: dict, geometry: dict) -> dict | None:
     if kind == "pick_up_tips":
-        return _tip_col_center(info["rack"], info["col"], geometry)
+        return _tip_spots_center(info["rack"], info.get("wells", []), geometry)
     if kind == "discard_tips":
         return geometry["trash_pos"]
     if kind in ("aspirate", "dispense"):
-        return _col_center(info["plate"], info["col"], geometry)
+        return _wells_center(info["plate"], info.get("wells", []), geometry)
     return None
 
 
 def _initial_frame(geometry: dict, env: RobotEnv, tip_rack_names: list[str]) -> dict:
-    return {"step": -1, "tool": "initial", "preview": "", "message": None,
+    return {"step": -1, "tool": "initial", "args": {}, "preview": "", "message": None,
             "pipette_pos": geometry["home_pos"], "movements": [],
             "snapshot": _snapshot(env, tip_rack_names)}
 
 
 def _done_frame(record_len: int, env: RobotEnv, tip_rack_names: list[str], final_text: str) -> dict:
-    return {"step": record_len, "tool": "done", "preview": "", "message": final_text,
+    return {"step": record_len, "tool": "done", "args": {}, "preview": "", "message": final_text,
             "pipette_pos": None, "movements": [],
             "snapshot": _snapshot(env, tip_rack_names)}
 
@@ -268,6 +276,9 @@ class LiveCapture:
             "kind": kind,
             "pipette_pos": _movement_target(kind, info, self.geometry),
             "show_tips": _SHOW_TIPS_AFTER.get(kind),
+            # Which of the 8 channels this movement actually uses, so the viewer
+            # can leave the idle ones empty instead of implying a full-column op.
+            "channels": list(info.get("channels", [])),
             "snapshot": _snapshot(self.env, self.tip_rack_names),
         })
 
@@ -284,6 +295,10 @@ class LiveCapture:
         frame = {
             "step": step_idx,
             "tool": name,
+            # The raw call is the protocol record — keep it so a saved run is
+            # self-describing and can be re-read (e.g. exported as a worklist)
+            # without replaying the simulation.
+            "args": args,
             "preview": preview_tool(name, args),
             "message": message,
             "pipette_pos": movements[-1]["pipette_pos"] if movements else None,

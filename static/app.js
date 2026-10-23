@@ -68,7 +68,8 @@ function colorForWell(entry) {
     // compound that happens to land at the same average — desaturating a
     // mix instead marks it as visually distinct from any single-compound
     // well. Hover for the exact contents rather than reading it off color.
-    const sat = hues.length > 1 ? 0.35 : 0.72;
+    // const sat = hues.length > 1 ? 0.35 : 0.72;
+    const sat = .72;
     c.setHSL(hue / 360, sat, 0.8 - pct * 0.5);
     return c;
   }
@@ -251,12 +252,28 @@ function alignChannels(plateName) {
 // ── Pipette animation ──────────────────────────────────────────────────
 let animState = null;
 
-function startAnim(toPos, onDone, showTips) {
+// Which channels a movement uses. A single-well transfer uses one; a full-column
+// transfer uses all eight. null means "unspecified" — treat as all, so frames
+// recorded before channel masks existed still animate.
+function channelMask(channels) {
+  if (!Array.isArray(channels) || channels.length === 0) return null;
+  const mask = new Array(8).fill(false);
+  channels.forEach(i => { if (i >= 0 && i < 8) mask[i] = true; });
+  return mask;
+}
+
+function setTips(visible, mask) {
+  tipOnPipette.forEach((m, i) => {
+    m.visible = visible && (mask === null || mask[i]);
+  });
+}
+
+function startAnim(toPos, onDone, showTips, mask = null) {
   if (!toPos) { onDone?.(); return; }
   const centerY = toPos.plate ? alignChannels(toPos.plate) : null;
   const toX = toPos.x;
   const toZ = -(centerY ?? toPos.y);
-  if (showTips != null) tipOnPipette.forEach(m => { m.visible = showTips; });
+  if (showTips != null) setTips(showTips, mask);
   animState = {
     fromX: channelGroup.position.x, fromZ: channelGroup.position.z,
     toX, toZ,
@@ -306,13 +323,14 @@ function playMovements(frame, onDone) {
   function step() {
     if (mi >= moves.length) { onDone?.(); return; }
     const mv = moves[mi++];
+    const mask = channelMask(mv.channels);
     startAnim(mv.pipette_pos, () => {
-      if (mv.show_tips != null) tipOnPipette.forEach(m => { m.visible = mv.show_tips; });
+      if (mv.show_tips != null) setTips(mv.show_tips, mask);
       updateWells(mv.snapshot);
       updateTipSpots(mv.snapshot);
       if (mi < moves.length) playTimeout = setTimeout(step, 120);
       else step();
-    }, null);
+    }, null, mask);
   }
   step();
 }
@@ -330,7 +348,7 @@ function goToFrame(idx, animate, onDone) {
     snapPipette(frame.pipette_pos);
     updateWells(frame.snapshot);
     updateTipSpots(frame.snapshot);
-    tipOnPipette.forEach(m => { m.visible = false; });
+    setTips(false, null);
     onDone?.();
   }
 }
@@ -965,17 +983,17 @@ const MOCK_EVENTS = [
     type: 'proposals', tools: [
       {
         name: 'propose_prime',
-        preview: 'source_plate col 1: Drug A @ 10 µM  (200 µL/well)\nsource_plate col 2: Drug B @ 10 µM  (200 µL/well)\nsource_plate col 3: media/buffer  (200 µL/well)',
+        preview: 'source_plate A1..H1 (8 wells): Drug A @ 10 µM  (200 µL/well)\nsource_plate A2..H2 (8 wells): Drug B @ 10 µM  (200 µL/well)\nsource_plate A3..H3 (8 wells): media/buffer  (200 µL/well)',
       },
       {
-        name: 'column_transfer',
-        preview: 'source_plate col 1 → assay_plate col 1  (50 µL)  [transfer_cells]',
+        name: 'transfer',
+        preview: 'source_plate A1..H1 (8 wells) → dest_plate A1..H1 (8 wells)  (50 µL)  [transfer_cells]',
       },
     ],
   },
   { type: 'acting' },
   { type: 'tool_result', name: 'propose_prime', ok: true },
-  { type: 'tool_result', name: 'column_transfer', ok: false, error: 'tip rack A1 empty' },
+  { type: 'tool_result', name: 'transfer', ok: false, error: 'tip rack A1 empty' },
   { type: 'thinking' },
   { type: 'agent_text', text: 'Tip rack A1 was empty — reloading tips before continuing.' },
   {
@@ -1129,9 +1147,16 @@ async function toggleHardware() {
 }
 
 // ── Save / load a run ─────────────────────────────────────────────────────
+// Bumped when the frame format changes. 2 = per-well: movements carry a
+// `channels` mask and frames carry the raw tool `args`.
+const RUN_FORMAT = 2;
+
 function saveRun() {
   if (FRAMES.length === 0) return;
-  const payload = { title: document.title, savedAt: new Date().toISOString(), frames: FRAMES };
+  const payload = {
+    title: document.title, savedAt: new Date().toISOString(),
+    format: RUN_FORMAT, frames: FRAMES,
+  };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1154,6 +1179,15 @@ function loadRunFile(file) {
     if (!Array.isArray(data.frames) || data.frames.length === 0) {
       appendMsg('error', 'Run file has no frames to play back.');
       return;
+    }
+    const format = data.format ?? 1;
+    if (format < RUN_FORMAT) {
+      // Older runs still replay: every movement predates per-channel masks, and
+      // an absent mask means "all 8 channels", which is exactly what those
+      // column-at-a-time runs did.
+      appendMsg('notice', `Run saved in an older format (v${format}) — replaying with all 8 channels shown, since it predates single-channel operations.`);
+    } else if (format > RUN_FORMAT) {
+      appendMsg('error', `Run was saved by a newer version (v${format}, this build reads v${RUN_FORMAT}). Playback may be wrong.`);
     }
 
     isPlaying = false;

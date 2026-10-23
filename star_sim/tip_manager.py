@@ -1,11 +1,19 @@
-"""TipManager: safe, cursor-based tip acquisition for the 8-channel head.
+"""TipManager: per-tip acquisition for the 8-channel head.
 
-The Hamilton 96-tip rack has 12 columns (A-H x 1-12). With an 8-channel head
-you consume one full column per pickup. TipManager tracks which columns have
-been used and advances a cursor so callers never reach for an empty position.
+The Hamilton 96-tip rack is 8 rows (A-H) x 12 columns. Because the channels sit
+on a fixed pitch, a single pickup can only take tips from **one column**, one tip
+per row — but it need not take all eight. A single-channel operation consumes one
+tip, not a whole column, so a rack really does hold 96 single-channel operations
+rather than 12.
+
+Tip presence itself lives in PyLabRobot's tip tracker, not here; this class only
+decides *which* spots to reach for. That means it stays correct even if tips are
+consumed by something other than `acquire()`.
 """
 
 from pylabrobot.resources import TipRack
+
+from .channels import ROWS
 
 
 class OutOfTipsError(Exception):
@@ -13,60 +21,86 @@ class OutOfTipsError(Exception):
 
 
 class TipManager:
-    """Cursor into a TipRack that advances one column per pickup.
+    """Chooses tip spots for the rows a pipetting step needs.
 
     Usage::
 
         mgr = TipManager(layout.tip_rack)
-        tips = mgr.next_column()   # returns rack["A1:H1"] first call
-        await lh.pick_up_tips(tips)
+        spots = mgr.acquire(["A", "B"])   # two tips from the leftmost column
+        await lh.pick_up_tips(spots)      # that has both free
         ...
-        await lh.drop_tips(tips)
-        tips = mgr.next_column()   # returns rack["A2:H2"] next call
+        await lh.discard_tips()
     """
 
     def __init__(self, rack: TipRack) -> None:
         self._rack = rack
-        self._cursor = 0  # next column index (0-based)
-        self.last_column: int | None = None  # column number (1-based) returned by the last next_column() call
+        self.last_spots: list[str] = []  # well ids of the most recent acquire()
+
+    @property
+    def rows(self) -> str:
+        return ROWS[: self._rack.num_items_y]
+
+    @property
+    def num_columns(self) -> int:
+        return self._rack.num_items_x
 
     @property
     def remaining(self) -> int:
-        """Columns with all tips still present, from the cursor onward."""
-        n_cols = self._rack.num_items_x
-        count = 0
-        for col_idx in range(self._cursor, n_cols):
-            col_num = col_idx + 1
-            if self._column_full(col_num):
-                count += 1
-        return count
+        """Individual tips still on the rack."""
+        return sum(
+            1
+            for col in range(1, self.num_columns + 1)
+            for row in self.rows
+            if self._has_tip(row, col)
+        )
 
-    def next_column(self):
-        """Return the tip spots for the next unused column.
+    @property
+    def free_rows_by_column(self) -> dict[int, str]:
+        """{column: row letters still holding a tip}. Columns with none are omitted."""
+        out = {}
+        for col in range(1, self.num_columns + 1):
+            free = "".join(r for r in self.rows if self._has_tip(r, col))
+            if free:
+                out[col] = free
+        return out
 
-        Skips any column that is partially or fully spent (handles cases where
-        the rack was pre-used before this manager was created).
+    def acquire(self, rows: list[str]) -> list:
+        """Return tip spots for `rows`, all from a single column.
+
+        Scans columns left to right for the first one holding a tip at every
+        requested row, so partially used columns get filled in before fresh ones
+        are opened. Returns spots in row order.
 
         Raises:
-            OutOfTipsError: if no full column remains.
+            OutOfTipsError: if no single column can serve all of `rows`.
         """
-        n_cols = self._rack.num_items_x
-        while self._cursor < n_cols:
-            col_num = self._cursor + 1
-            self._cursor += 1
-            if self._column_full(col_num):
-                self.last_column = col_num
-                return self._rack[f"A{col_num}:H{col_num}"]
-        raise OutOfTipsError(f"Tip rack '{self._rack.name}' is exhausted")
+        wanted = self._validate(rows)
+        for col in range(1, self.num_columns + 1):
+            if all(self._has_tip(r, col) for r in wanted):
+                self.last_spots = [f"{r}{col}" for r in wanted]
+                return [self._rack.get_item(w) for w in self.last_spots]
 
-    def reset(self) -> None:
-        """Reset the cursor to column 1 (does not restore physical tip state)."""
-        self._cursor = 0
-
-    def _column_full(self, col_num: int) -> bool:
-        n_rows = self._rack.num_items_y
-        rows = "ABCDEFGH"[:n_rows]
-        return all(
-            self._rack.get_item(f"{row}{col_num}").tracker.has_tip
-            for row in rows
+        raise OutOfTipsError(
+            f"Tip rack '{self._rack.name}' has no remaining column with free tips "
+            f"in rows {''.join(wanted)} ({self.remaining} tips left overall). "
+            f"Free rows per column: {self.free_rows_by_column or 'none'}."
         )
+
+    def _validate(self, rows: list[str]) -> list[str]:
+        if not rows:
+            raise ValueError("acquire() needs at least one row.")
+        wanted = []
+        for r in rows:
+            up = str(r).strip().upper()
+            if up not in self.rows:
+                raise ValueError(
+                    f"Unknown tip row {r!r}. This rack has rows {self.rows}."
+                )
+            if up in wanted:
+                raise ValueError(f"Row {up} requested twice in one pickup.")
+            wanted.append(up)
+        # Row order, so the returned spots line up with channel order.
+        return sorted(wanted, key=self.rows.index)
+
+    def _has_tip(self, row: str, col: int) -> bool:
+        return self._rack.get_item(f"{row}{col}").tracker.has_tip

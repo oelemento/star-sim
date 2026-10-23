@@ -25,33 +25,47 @@ pip install --user -r requirements.txt
 python app.py
 ```
 
-## Layout
+## Test
 
-**OUTDATED**
+```bash
+pip install --user pytest pytest-asyncio
+pytest
+```
+
+## Layout
 
 ```
 star_sim/
   deck.py         build_starlet_deck() -> deck + named resource handles
   lab.py          make_liquid_handler(use_hardware) -> sim or STAR backend
   env.py          observe() -> current machine state, useful for agent entry points
+  channels.py     well selectors + schedule() -> the 8-channel head's geometry rules
+  primitives.py   transfer() and mix(), the two operations the agent composes
   plate_map.py    PlateMap -> tracks compounds and concentrations
-  tip_manager.py  TipManager -> cursor over tip rack
-protocols/
-  serial_dilution.py   demo: 8-channel 2-fold serial dilution (unused)
-  primitives.py        protocol primitives used by the agent such as single-use column transfer or serial transfer
-agent.py      Wrapper for Anthropic and OpenAI-like APIs
+  tip_manager.py  TipManager -> per-tip allocation from the rack
+agent.py      Tool schemas, system prompt, dispatch, and wrappers for the
+              Anthropic and OpenAI-compatible APIs
 app.py        Uvicorn app, provides browser-based interface
+render.py     Deck geometry, per-step frame capture, and HTML rendering
+tests/        pytest suite
+_samples/     real Hamilton Venus method exports, for reference only
 ```
+
+Wells are addressed directly: `"B3"`, a range `"A1:H1"`, or a list. Because the
+8 channels sit on a fixed pitch, a transfer stays within its row and one movement
+covers one column — `star_sim/channels.py` turns any well list into the sequence
+of movements the machine would really make. See `CLAUDE.md` for the details.
 
 ## TODO
 - Branching experimental designs
 - Dynamic and easily configurable deck layouts (potential interop with existing Hamilton software tools?)
-- Single-channel pipetting
 - Full documentation
 - Advanced LLM model picker and configuration
 - Long-term planning
 - Multi-agent experimental validation
 - Facile deployment onto in-unit Hamilton PC
+- Worklist export (Venus-readable CSV/xlsx) — see `CLAUDE.md`
+- HARD BENCHMARK FOR GOOD HAMILTON EXPERIMENTS
 
 ### Issues
 - propose_prime can sometimes suggest "0 ul/well" volumes in anticipation of future liquid movement

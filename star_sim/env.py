@@ -12,7 +12,7 @@ Use as an async context manager::
 
     async with RobotEnv() as env:
         state = env.observe()
-        tips = env.tips.next_column()
+        tips = env.tips.acquire(["A", "B"])
         await env.lh.pick_up_tips(tips)
         ...
 """
@@ -26,7 +26,7 @@ from .lab import make_liquid_handler
 from .plate_map import PlateMap
 from .tip_manager import TipManager
 from pylabrobot.liquid_handling import LiquidHandler
-from pylabrobot.resources import Plate, TipRack
+from pylabrobot.resources import Plate
 
 
 class RobotEnv:
@@ -85,13 +85,13 @@ class RobotEnv:
 
         Suitable for passing directly to an AI agent as tool output or context.
         All volumes in microlitres. Plate wells map well_id → volume_ul (float).
-        Tip rack maps position → has_tip (bool).
+        The tip rack reports, per column, which rows still hold a tip.
         """
         return {
             "source_plate": _plate_state(self.layout.source_plate),
             "dest_plate": _plate_state(self.layout.dest_plate),
-            "tip_rack": _rack_state(self.layout.tip_rack),
-            "tips_remaining_columns": self.tips.remaining,
+            "tip_rack_free_rows": self.tips.free_rows_by_column,
+            "tips_remaining": self.tips.remaining,
             "plate_map": self.plate_map.to_dict(),
         }
 
@@ -116,14 +116,7 @@ def _plate_state(plate: Plate) -> dict[str, float]:
     return state
 
 
-def _rack_state(rack: TipRack) -> dict[int, bool]:
-    """Map each tip COLUMN (not individual position) to whether it still has
-    a full set of tips. The 8-channel head only ever picks up (or has picked
-    up) a whole column at once — per-position detail is dead weight the
-    model can't act on, not useful precision.
-    """
-    rows = "ABCDEFGH"[: rack.num_items_y]
-    state = {}
-    for col in range(1, rack.num_items_x + 1):
-        state[col] = all(rack.get_item(f"{row}{col}").tracker.has_tip for row in rows)
-    return state
+# Tip state is reported by TipManager.free_rows_by_column: {column: "ABCDEFGH"}
+# of the rows still holding a tip. Per-column booleans used to be enough, back
+# when a pickup always consumed a whole column — now that a single-channel step
+# takes exactly one tip, which rows remain is something the agent can act on.

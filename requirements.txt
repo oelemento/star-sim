@@ -2,6 +2,11 @@
 # Tested with pylabrobot 0.2.1, anthropic 0.107+ on Python 3.11+.
 pylabrobot>=0.2.1
 anthropic>=0.50.0
+openai>=1.40.0        # OpenAI-compatible providers: Groq, Ollama, Moonshot, OpenRouter
 python-dotenv
 fastapi>=0.111.0
 uvicorn>=0.29.0
+
+# Tests
+pytest>=8.0
+pytest-asyncio>=0.23

@@ -5,3 +5,4 @@ venv/
 .env
 runs/
 .viz_cache/
+.DS_Store

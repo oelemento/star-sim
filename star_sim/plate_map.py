@@ -11,7 +11,7 @@ a synergy assay) plus a cell line with density.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 _ROWS = "ABCDEFGH"
@@ -113,9 +113,15 @@ class PlateMap:
         self._data.setdefault(plate, {})[well] = contents
 
     def set_column(self, plate: str, col: int, contents: WellContents) -> None:
-        """Set the same contents for all 8 wells of a column at once."""
+        """Set equivalent contents for all 8 wells of a column at once.
+
+        Each well gets its own copy: sharing one instance across eight wells means
+        any later in-place edit silently changes all of them.
+        """
         for row in _ROWS:
-            self.set_well(plate, f"{row}{col}", contents)
+            self.set_well(plate, f"{row}{col}", replace(
+                contents, compounds=list(contents.compounds)
+            ))
 
     def get_well(self, plate: str, well: str) -> Optional[WellContents]:
         return self._data.get(plate, {}).get(well)

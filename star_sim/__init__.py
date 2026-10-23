@@ -5,6 +5,7 @@ visualizer) or the physical Hamilton STAR, selected by a single flag. Intended a
 a safe testbed for AI-directed liquid-handling experiments.
 """
 
+from .channels import Move, SelectionError, pair, parse_selector, schedule
 from .deck import build_starlet_deck
 from .env import RobotEnv
 from .lab import make_liquid_handler
@@ -20,4 +21,9 @@ __all__ = [
     "PlateMap",
     "WellContents",
     "Compound",
+    "Move",
+    "SelectionError",
+    "parse_selector",
+    "pair",
+    "schedule",
 ]
